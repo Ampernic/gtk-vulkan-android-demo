@@ -249,11 +249,13 @@ gears_view_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
       if (node)
         {
           gint64 t0 = g_get_monotonic_time ();
+          /* gsk_renderer_render_texture() already waits for the GPU before it
+           * returns (it downloads into the result), so this measures the real
+           * render cost. We deliberately do NOT add a second gdk_texture_download:
+           * that extra GPU->CPU readback (and tile resolve on Mali) is renderer-
+           * unfair noise, not render cost. */
           GdkTexture *tex = gsk_renderer_render_texture (self->renderer, node,
                                                          &GRAPHENE_RECT_INIT (0, 0, BENCH, BENCH));
-          if (self->dlbuf == NULL)
-            self->dlbuf = g_malloc ((gsize) BENCH * BENCH * 4);
-          gdk_texture_download (tex, self->dlbuf, BENCH * 4);   /* force GPU completion */
           gint64 t1 = g_get_monotonic_time ();
 
           double ms = (t1 - t0) / 1000.0;
