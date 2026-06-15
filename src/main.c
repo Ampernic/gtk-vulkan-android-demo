@@ -1,8 +1,11 @@
 /*
  * gtk-vulkan-android-demo - compare the GSK renderers (Vulkan / OpenGL / Cairo)
- * on a heavy 3D scene. The scene is rendered off-screen with
- * gsk_renderer_render_texture() and forced to completion, so the reported
- * frame time is the renderer's real cost, not the vsync-capped on-screen rate.
+ * on a heavy 3D scene. Each renderer is created explicitly and realized for the
+ * display, then the scene is rendered off-screen with gsk_renderer_render_texture()
+ * and forced to completion, so the reported frame time is that renderer's real
+ * cost (not the vsync-capped on-screen rate). Switching renderer just swaps the
+ * off-screen renderer in place - no process relaunch, so it works on Android too,
+ * where the process is owned by the Android runtime and cannot re-exec itself.
  * Built to demonstrate the gdk-android Vulkan backend; runs on any GTK 4 platform.
  *
  * SPDX-License-Identifier: LGPL-3.0-or-later
@@ -108,6 +111,8 @@ build_scene (GtkSnapshot *s, double w, double h, GdkTexture *gear,
 
 /* ---- the widget: off-screen benchmark + on-screen display ------------- */
 
+/* combo order: 0 Vulkan, 1 OpenGL, 2 Cairo */
+
 #define GEARS_TYPE_VIEW (gears_view_get_type ())
 G_DECLARE_FINAL_TYPE (GearsView, gears_view, GEARS, VIEW, GtkWidget)
 
@@ -115,7 +120,8 @@ struct _GearsView
 {
   GtkWidget    parent_instance;
   GdkTexture  *gear;
-  GskRenderer *renderer;     /* the surface's renderer (off-screen target) */
+  GskRenderer *renderer;     /* off-screen renderer we own and benchmark */
+  int          backend;      /* selected backend; -1 = not yet initialised */
   GdkTexture  *frame;        /* last off-screen frame, shown on screen */
   guchar      *dlbuf;        /* reused download buffer (force GPU completion) */
   double       angle;
@@ -123,10 +129,89 @@ struct _GearsView
   gboolean     blur;
   double       render_ms;    /* smoothed off-screen frame cost (uncapped) */
   GtkLabel    *fps_label;
+  GtkLabel    *renderer_label;
+  AdwComboRow *combo;
 };
 G_DEFINE_FINAL_TYPE (GearsView, gears_view, GTK_TYPE_WIDGET)
 
 #define GEAR_PX 110.0
+
+static GskRenderer *
+make_renderer (int backend)
+{
+  switch (backend)
+    {
+    case 0:  return gsk_vulkan_renderer_new ();
+    case 2:  return gsk_cairo_renderer_new ();
+    default: return gsk_gl_renderer_new ();
+    }
+}
+
+static int
+renderer_backend (GskRenderer *r)
+{
+  const char *t = r ? G_OBJECT_TYPE_NAME (r) : "";
+  if (strstr (t, "Vulkan")) return 0;
+  if (strstr (t, "Cairo"))  return 2;
+  return 1; /* GL / Ngl */
+}
+
+static void
+update_renderer_label (GearsView *self)
+{
+  if (self->renderer_label == NULL || self->renderer == NULL)
+    return;
+  const char *names[] = { "Vulkan", "OpenGL", "Cairo (software)" };
+  char *s = g_strdup_printf ("Renderer: <b>%s</b>", names[renderer_backend (self->renderer)]);
+  gtk_label_set_markup (self->renderer_label, s);
+  g_free (s);
+}
+
+/* Swap the off-screen renderer in place. Falls back to GL if the requested
+ * backend cannot be realized (e.g. Vulkan on Android API < 28). */
+static void
+gears_view_set_backend (GearsView *self, int backend)
+{
+  if (backend == self->backend)
+    return;
+  GdkDisplay *display = gtk_widget_get_display (GTK_WIDGET (self));
+  if (display == NULL)
+    return;
+
+  GError *err = NULL;
+  GskRenderer *r = make_renderer (backend);
+  if (!gsk_renderer_realize_for_display (r, display, &err))
+    {
+      g_warning ("%s renderer unavailable: %s",
+                 backend == 0 ? "Vulkan" : backend == 2 ? "Cairo" : "OpenGL",
+                 err ? err->message : "(unknown)");
+      g_clear_error (&err);
+      g_object_unref (r);
+      if (backend == 1)             /* GL itself failed: nothing to fall back to */
+        return;
+      r = gsk_gl_renderer_new ();   /* graceful fallback */
+      if (!gsk_renderer_realize_for_display (r, display, &err))
+        {
+          g_clear_error (&err);
+          g_object_unref (r);
+          return;
+        }
+    }
+
+  if (self->renderer)
+    {
+      gsk_renderer_unrealize (self->renderer);
+      g_object_unref (self->renderer);
+    }
+  self->renderer = r;
+  self->backend = renderer_backend (r);   /* effective backend (after any fallback) */
+  self->render_ms = 0;
+  g_clear_object (&self->frame);
+
+  update_renderer_label (self);
+  if (self->combo)
+    adw_combo_row_set_selected (self->combo, (guint) self->backend);
+}
 
 static void
 gears_view_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
@@ -143,17 +228,14 @@ gears_view_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
 {
   GearsView *self = GEARS_VIEW (widget);
 
-  if (!self->renderer)
-    {
-      GtkNative *n = gtk_widget_get_native (widget);
-      self->renderer = n ? gtk_native_get_renderer (n) : NULL;
-    }
+  if (self->backend < 0)
+    gears_view_set_backend (self, 0);   /* prefer Vulkan; falls back to GL */
   if (!self->renderer)
     return G_SOURCE_CONTINUE;
 
-  /* build the scene and render it off-screen with the active renderer; the
+  /* build the scene and render it off-screen with the chosen renderer; the
    * Cairo (software) renderer has no 3D, so feed it the flat variant */
-  gboolean flat = strstr (G_OBJECT_TYPE_NAME (self->renderer), "Cairo") != NULL;
+  gboolean flat = renderer_backend (self->renderer) == 2;
   GtkSnapshot *s = gtk_snapshot_new ();
   build_scene (s, BENCH, BENCH, self->gear, self->angle, self->density, self->blur, flat);
   GskRenderNode *node = gtk_snapshot_free_to_node (s);
@@ -193,6 +275,11 @@ static void
 gears_view_dispose (GObject *o)
 {
   GearsView *self = GEARS_VIEW (o);
+  if (self->renderer)
+    {
+      gsk_renderer_unrealize (self->renderer);
+      g_clear_object (&self->renderer);
+    }
   g_clear_object (&self->gear);
   g_clear_object (&self->frame);
   g_clear_pointer (&self->dlbuf, g_free);
@@ -211,33 +298,10 @@ gears_view_init (GearsView *self)
 {
   GdkRGBA c = { 0.22f, 0.55f, 0.92f, 1.0f };
   self->gear = make_gear_texture (GEAR_PX, &c);
+  self->backend = -1;
   self->density = 10;
   self->blur = TRUE;
   gtk_widget_add_tick_callback (GTK_WIDGET (self), gears_view_tick, NULL, NULL);
-}
-
-/* ---- relaunch under a chosen GSK renderer ----------------------------- */
-
-static char **saved_argv;
-
-static const char *gsk_names[] = { "vulkan", "gl", "cairo" };  /* combo order */
-
-static int
-renderer_index (GtkWidget *root)
-{
-  GskRenderer *r = gtk_native_get_renderer (GTK_NATIVE (root));
-  const char *t = r ? G_OBJECT_TYPE_NAME (r) : "";
-  if (strstr (t, "Vulkan")) return 0;
-  if (strstr (t, "Cairo"))  return 2;
-  return 1; /* GL / Ngl */
-}
-
-static void
-relaunch_with_renderer (const char *renderer)
-{
-  g_setenv ("GSK_RENDERER", renderer, TRUE);
-  execv ("/proc/self/exe", saved_argv);
-  g_warning ("re-exec failed: %s", g_strerror (errno));
 }
 
 /* ---- UI --------------------------------------------------------------- */
@@ -245,11 +309,7 @@ relaunch_with_renderer (const char *renderer)
 static void
 on_renderer_selected (AdwComboRow *row, GParamSpec *ps, gpointer data)
 {
-  GtkWidget *root = GTK_WIDGET (gtk_widget_get_root (GTK_WIDGET (row)));
-  guint sel = adw_combo_row_get_selected (row);
-  if ((int) sel == renderer_index (root))   /* programmatic sync, not a user change */
-    return;
-  relaunch_with_renderer (gsk_names[sel]);
+  gears_view_set_backend (GEARS_VIEW (data), (int) adw_combo_row_get_selected (row));
 }
 
 static void
@@ -262,23 +322,6 @@ static void
 on_density (GtkAdjustment *adj, gpointer data)
 {
   GEARS_VIEW (data)->density = (int) gtk_adjustment_get_value (adj);
-}
-
-static void
-on_map (GtkWidget *window, gpointer data)
-{
-  GtkWidget *combo = g_object_get_data (G_OBJECT (window), "rcombo");
-  GtkWidget *rlabel = g_object_get_data (G_OBJECT (window), "rlabel");
-  int idx = renderer_index (window);
-  const char *names[] = { "Vulkan", "OpenGL", "Cairo (software)" };
-  if (rlabel)
-    {
-      char *s = g_strdup_printf ("Renderer: <b>%s</b>", names[idx]);
-      gtk_label_set_markup (GTK_LABEL (rlabel), s);
-      g_free (s);
-    }
-  if (combo)
-    adw_combo_row_set_selected (ADW_COMBO_ROW (combo), idx);  /* sync (relaunch guarded) */
 }
 
 static void
@@ -312,6 +355,7 @@ activate (GtkApplication *app, gpointer data)
   gtk_box_append (GTK_BOX (info), fps);
   gtk_overlay_add_overlay (GTK_OVERLAY (overlay), info);
   GEARS_VIEW (gears)->fps_label = GTK_LABEL (fps);
+  GEARS_VIEW (gears)->renderer_label = GTK_LABEL (rlabel);
 
   /* controls: HIG boxed list (its own card backing) */
   GtkWidget *list = gtk_list_box_new ();
@@ -321,9 +365,10 @@ activate (GtkApplication *app, gpointer data)
   GtkStringList *models = gtk_string_list_new ((const char *[]){ "Vulkan", "OpenGL", "Cairo", NULL });
   GtkWidget *rcombo = adw_combo_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (rcombo), "Renderer");
-  adw_action_row_set_subtitle (ADW_ACTION_ROW (rcombo), "Relaunches the app under the chosen GSK renderer");
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (rcombo), "GSK renderer used for the benchmark");
   adw_combo_row_set_model (ADW_COMBO_ROW (rcombo), G_LIST_MODEL (models));
-  g_signal_connect (rcombo, "notify::selected", G_CALLBACK (on_renderer_selected), NULL);
+  GEARS_VIEW (gears)->combo = ADW_COMBO_ROW (rcombo);
+  g_signal_connect (rcombo, "notify::selected", G_CALLBACK (on_renderer_selected), gears);
   gtk_list_box_append (GTK_LIST_BOX (list), rcombo);
 
   GtkWidget *blur = adw_switch_row_new ();
@@ -357,21 +402,14 @@ activate (GtkApplication *app, gpointer data)
   adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (toolbar), content);
 
   adw_application_window_set_content (ADW_APPLICATION_WINDOW (win), toolbar);
-
-  g_object_set_data (G_OBJECT (win), "rcombo", rcombo);
-  g_object_set_data (G_OBJECT (win), "rlabel", rlabel);
-  g_signal_connect (win, "map", G_CALLBACK (on_map), NULL);
   gtk_window_present (GTK_WINDOW (win));
 }
 
 int
 main (int argc, char **argv)
 {
-  saved_argv = argv;
-  /* NON_UNIQUE so relaunching under a different GSK_RENDERER starts a fresh
-   * instance instead of forwarding activation to the running one. */
   AdwApplication *app = adw_application_new ("space.ampernic.GtkVulkanDemo",
-                                             G_APPLICATION_NON_UNIQUE);
+                                             G_APPLICATION_DEFAULT_FLAGS);
   g_signal_connect (app, "activate", G_CALLBACK (activate), NULL);
   return g_application_run (G_APPLICATION (app), argc, argv);
 }
