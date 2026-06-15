@@ -14,7 +14,17 @@ deps = [
   cc.find_library('m', required: false),
 ]
 
+# android_exe_type is a Pixiewood meson-fork kwarg; on Android the entry must be
+# the shared library RuntimeApplication dlopens (libgtk-vulkan-demo.so), not a
+# plain executable. Only pass it when targeting Android so stock meson doesn't
+# choke on the unknown kwarg.
+exe_kwargs = {}
+if host_machine.system() == 'android'
+  exe_kwargs = {'android_exe_type': 'application'}
+endif
+
 executable('gtk-vulkan-demo',
   'src/main.c',
   dependencies: deps,
+  kwargs: exe_kwargs,
   install: true)
