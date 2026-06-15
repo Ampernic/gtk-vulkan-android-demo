@@ -1,0 +1,89 @@
+From 0c701ed54455051f28de54ee54397c4d1db5c30b Mon Sep 17 00:00:00 2001
+From: Ampernic <ampernic@inbox.ru>
+Date: Mon, 15 Jun 2026 11:12:01 +0300
+Subject: [PATCH 2/2] gdk/android: fall back to
+ AChoreographer_postFrameCallback below API 29
+
+AChoreographer_postFrameCallback64 is __INTRODUCED_IN(29); on API 26-28
+use the deprecated AChoreographer_postFrameCallback (API 24). long is
+64-bit on arm64/x86_64 so the int64_t callback is ABI-compatible.
+---
+ gdk/android/gdkandroidchoreographersource.c | 41 ++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/gdk/android/gdkandroidchoreographersource.c b/gdk/android/gdkandroidchoreographersource.c
+index 4ce7a50..53ed8f2 100644
+--- a/gdk/android/gdkandroidchoreographersource.c
++++ b/gdk/android/gdkandroidchoreographersource.c
+@@ -47,6 +47,7 @@
+ #include "gdkandroidutils-private.h"
+ 
+ #include <android/choreographer.h>
++#include <android/api-level.h>
+ #include <stdint.h>
+ 
+ struct _GdkAndroidChoreographerSource
+@@ -61,6 +62,34 @@ struct _GdkAndroidChoreographerSource
+   GMainContext *context;
+ };
+ 
++/* AChoreographer_postFrameCallback64 is __INTRODUCED_IN(29); on API 26-28 fall
++ * back to the deprecated AChoreographer_postFrameCallback (API 24). Its callback
++ * takes `long`, which on arm64 (our only ABI) is 64-bit, so the int64_t callback
++ * is ABI-compatible. */
++static void
++gdk_android_choreographer_post (AChoreographer                 *choreographer,
++                                AChoreographer_frameCallback64  callback,
++                                void                           *data)
++{
++  if (android_get_device_api_level () >= 29)
++    {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunguarded-availability"
++#pragma clang diagnostic ignored "-Wunguarded-availability-new"
++      AChoreographer_postFrameCallback64 (choreographer, callback, data);
++#pragma clang diagnostic pop
++    }
++  else
++    {
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++      AChoreographer_postFrameCallback (choreographer,
++                                        (AChoreographer_frameCallback) callback,
++                                        data);
++#pragma clang diagnostic pop
++    }
++}
++
+ static void
+ gdk_android_choreographer_source_on_frame (int64_t frame_time_nanos,
+                                            void *data)
+@@ -75,9 +104,9 @@ gdk_android_choreographer_source_on_frame (int64_t frame_time_nanos,
+   if (g_atomic_int_compare_and_exchange (&self->needs_dispatch, FALSE, TRUE))
+     g_main_context_wakeup (self->context);
+ 
+-  AChoreographer_postFrameCallback64 (self->choreographer,
+-                                      gdk_android_choreographer_source_on_frame,
+-                                      self);
++  gdk_android_choreographer_post (self->choreographer,
++                                  gdk_android_choreographer_source_on_frame,
++                                  self);
+ }
+ 
+ static gboolean
+@@ -178,9 +207,9 @@ gdk_android_choreographer_source_unpause (GdkAndroidChoreographerSource *self)
+ 
+   g_atomic_int_set (&self->paused, FALSE);
+ 
+-  AChoreographer_postFrameCallback64 (self->choreographer,
+-                                      gdk_android_choreographer_source_on_frame,
+-                                      self);
++  gdk_android_choreographer_post (self->choreographer,
++                                  gdk_android_choreographer_source_on_frame,
++                                  self);
+ }
+ 
+ gint64
+-- 
+2.50.1
+

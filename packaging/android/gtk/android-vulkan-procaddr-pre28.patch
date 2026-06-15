@@ -1,0 +1,285 @@
+From ad8681d4f1ae1ff7761feafaba28bbda77d2ce3d Mon Sep 17 00:00:00 2001
+From: Ampernic <ampernic@inbox.ru>
+Date: Mon, 15 Jun 2026 14:26:06 +0300
+Subject: [PATCH] gdk,gsk: load Vulkan 1.1 entry points via
+ vkGet{Instance,Device}ProcAddr
+
+The Vulkan 1.1 core functions (vkGetPhysicalDeviceProperties2/Features2/
+FormatProperties2/ImageFormatProperties2/ExternalSemaphoreProperties,
+vkGetImageMemoryRequirements2, vkBindImageMemory2,
+vkCreate/DestroySamplerYcbcrConversion) are called directly across gdk and
+the gsk Vulkan GPU renderer. On Android libvulkan only exports them as
+link-time symbols from API 28, and the Khronos headers carry no
+__INTRODUCED_IN annotation, so a minSdk-26 build cannot reference them.
+
+Resolve them at runtime instead: instance-level via vkGetInstanceProcAddr
+after instance creation, device-level via vkGetDeviceProcAddr after device
+creation, stored on GdkDisplay (which already holds every Vulkan handle the
+gsk renderer reaches through gsk_gpu_device_get_display). If the instance
+functions are NULL (a Vulkan 1.0 loader, e.g. Android 8-9), instance setup
+bails and GTK falls back to the GL renderer. No behavior change on
+API 28+ / desktop.
+---
+ gdk/gdkdisplayprivate.h   | 16 +++++++++++++
+ gdk/gdkvulkancontext.c    | 50 +++++++++++++++++++++++++++++++++++----
+ gsk/gpu/gskvulkandevice.c |  2 +-
+ gsk/gpu/gskvulkanimage.c  | 18 +++++++-------
+ gsk/gpu/gskvulkanycbcr.c  |  7 ++++--
+ 5 files changed, 76 insertions(+), 17 deletions(-)
+
+diff --git a/gdk/gdkdisplayprivate.h b/gdk/gdkdisplayprivate.h
+index 53ac789..4bb0d51 100644
+--- a/gdk/gdkdisplayprivate.h
++++ b/gdk/gdkdisplayprivate.h
+@@ -107,6 +107,22 @@ struct _GdkDisplay
+   VkInstance vk_instance;
+   VkDebugReportCallbackEXT vk_debug_callback;
+   VkPhysicalDevice vk_physical_device;
++  /* Vulkan 1.1 entry points resolved at runtime via vkGetInstanceProcAddr /
++   * vkGetDeviceProcAddr rather than linked directly: Android's libvulkan only
++   * exports them as link-time symbols from API 28, so a minSdk-26 build cannot
++   * reference them (and the Khronos headers carry no __INTRODUCED_IN annotation,
++   * so the weak-symbol flag does not help). The instance-level ones are loaded
++   * after the instance is created (NULL on a 1.0 loader -> the setup bails to GL);
++   * the device-level ones after the device is created. */
++  PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
++  PFN_vkGetPhysicalDeviceFormatProperties2 vkGetPhysicalDeviceFormatProperties2;
++  PFN_vkGetPhysicalDeviceExternalSemaphoreProperties vkGetPhysicalDeviceExternalSemaphoreProperties;
++  PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
++  PFN_vkGetPhysicalDeviceImageFormatProperties2 vkGetPhysicalDeviceImageFormatProperties2;
++  PFN_vkGetImageMemoryRequirements2 vkGetImageMemoryRequirements2;
++  PFN_vkBindImageMemory2 vkBindImageMemory2;
++  PFN_vkCreateSamplerYcbcrConversion vkCreateSamplerYcbcrConversion;
++  PFN_vkDestroySamplerYcbcrConversion vkDestroySamplerYcbcrConversion;
+   VkDevice vk_device;
+   VkQueue vk_queue;
+   uint32_t vk_queue_family_index;
+diff --git a/gdk/gdkvulkancontext.c b/gdk/gdkvulkancontext.c
+index 0f324fd..8ea1cb6 100644
+--- a/gdk/gdkvulkancontext.c
++++ b/gdk/gdkvulkancontext.c
+@@ -610,7 +610,7 @@ physical_device_supports_extension (VkPhysicalDevice  device,
+ }
+ 
+ static GdkVulkanFeatures
+-physical_device_check_features (VkPhysicalDevice device)
++physical_device_check_features (GdkDisplay *display, VkPhysicalDevice device)
+ {
+   VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchain_maintenance1_features = {
+       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+@@ -632,8 +632,8 @@ physical_device_check_features (VkPhysicalDevice device)
+   };
+   GdkVulkanFeatures features;
+ 
+-  vkGetPhysicalDeviceFeatures2 (device, &v10_features);
+-  vkGetPhysicalDeviceExternalSemaphoreProperties (device,
++  display->vkGetPhysicalDeviceFeatures2 (device, &v10_features);
++  display->vkGetPhysicalDeviceExternalSemaphoreProperties (device,
+                                                   &(VkPhysicalDeviceExternalSemaphoreInfo) {
+ 		                                      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+ 		                                      .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+@@ -1756,7 +1756,7 @@ gdk_display_create_vulkan_device (GdkDisplay  *display,
+       GdkVulkanFeatures features, device_features;
+       uint32_t n_queue_props;
+ 
+-      device_features = physical_device_check_features (devices[i]);
++      device_features = physical_device_check_features (display, devices[i]);
+ 
+       features = device_features & ~skip_features;
+ 
+@@ -1875,6 +1875,18 @@ gdk_display_create_vulkan_device (GdkDisplay  *display,
+               display->vk_queue_family_index = j;
+               display->vulkan_features = features;
+ 
++              /* Device-level Vulkan 1.1 functions: resolved via vkGetDeviceProcAddr
++               * for the same reason as the instance-level ones (not link-referenceable
++               * on Android below API 28). Only reached on a >=1.1 device. */
++              display->vkGetImageMemoryRequirements2 = (PFN_vkGetImageMemoryRequirements2)
++                  vkGetDeviceProcAddr (display->vk_device, "vkGetImageMemoryRequirements2");
++              display->vkBindImageMemory2 = (PFN_vkBindImageMemory2)
++                  vkGetDeviceProcAddr (display->vk_device, "vkBindImageMemory2");
++              display->vkCreateSamplerYcbcrConversion = (PFN_vkCreateSamplerYcbcrConversion)
++                  vkGetDeviceProcAddr (display->vk_device, "vkCreateSamplerYcbcrConversion");
++              display->vkDestroySamplerYcbcrConversion = (PFN_vkDestroySamplerYcbcrConversion)
++                  vkGetDeviceProcAddr (display->vk_device, "vkDestroySamplerYcbcrConversion");
++
+               GDK_DISPLAY_DEBUG (display, VULKAN, "Enabled features (use GDK_VULKAN_DISABLE env var to disable):");
+               for (i = 0; i < G_N_ELEMENTS (gdk_vulkan_feature_keys); i++)
+                 {
+@@ -2021,6 +2033,34 @@ gdk_display_create_vulkan_instance (GdkDisplay  *display,
+       return FALSE;
+     }
+ 
++  /* Resolve the Vulkan 1.1 instance-level functions at runtime rather than linking
++   * them directly: on Android they are only exported by libvulkan from API 28, so a
++   * minSdk-26 build cannot reference them at link time. A Vulkan 1.0 loader returns
++   * NULL for the 1.1 core names — treat that as "no usable Vulkan" and fall back to
++   * the GL renderer instead of crashing later when one of them is called. */
++  display->vkGetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)
++      vkGetInstanceProcAddr (display->vk_instance, "vkGetPhysicalDeviceFeatures2");
++  display->vkGetPhysicalDeviceFormatProperties2 = (PFN_vkGetPhysicalDeviceFormatProperties2)
++      vkGetInstanceProcAddr (display->vk_instance, "vkGetPhysicalDeviceFormatProperties2");
++  display->vkGetPhysicalDeviceExternalSemaphoreProperties = (PFN_vkGetPhysicalDeviceExternalSemaphoreProperties)
++      vkGetInstanceProcAddr (display->vk_instance, "vkGetPhysicalDeviceExternalSemaphoreProperties");
++  display->vkGetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)
++      vkGetInstanceProcAddr (display->vk_instance, "vkGetPhysicalDeviceProperties2");
++  display->vkGetPhysicalDeviceImageFormatProperties2 = (PFN_vkGetPhysicalDeviceImageFormatProperties2)
++      vkGetInstanceProcAddr (display->vk_instance, "vkGetPhysicalDeviceImageFormatProperties2");
++  if (display->vkGetPhysicalDeviceFeatures2 == NULL ||
++      display->vkGetPhysicalDeviceFormatProperties2 == NULL ||
++      display->vkGetPhysicalDeviceExternalSemaphoreProperties == NULL ||
++      display->vkGetPhysicalDeviceProperties2 == NULL ||
++      display->vkGetPhysicalDeviceImageFormatProperties2 == NULL)
++    {
++      g_set_error_literal (error, GDK_VULKAN_ERROR, GDK_VULKAN_ERROR_UNSUPPORTED,
++                           "Vulkan 1.1 instance functions are unavailable (loader is 1.0)");
++      vkDestroyInstance (display->vk_instance, NULL);
++      display->vk_instance = VK_NULL_HANDLE;
++      return FALSE;
++    }
++
+   if (have_debug_report)
+     {
+       PFN_vkCreateDebugReportCallbackEXT vkCreateDebugReportCallbackEXT;
+@@ -2153,7 +2193,7 @@ gdk_vulkan_context_add_dmabuf_format (GdkDisplay              *display,
+     return;
+ 
+   modifier_props.drmFormatModifierCount = G_N_ELEMENTS (modifier_list);
+-  vkGetPhysicalDeviceFormatProperties2 (display->vk_physical_device,
++  display->vkGetPhysicalDeviceFormatProperties2 (display->vk_physical_device,
+                                         vk_format,
+                                         &props);
+   g_warn_if_fail (modifier_props.drmFormatModifierCount < G_N_ELEMENTS (modifier_list));
+diff --git a/gsk/gpu/gskvulkandevice.c b/gsk/gpu/gskvulkandevice.c
+index 9cec687..059a5ae 100644
+--- a/gsk/gpu/gskvulkandevice.c
++++ b/gsk/gpu/gskvulkandevice.c
+@@ -363,7 +363,7 @@ gsk_vulkan_device_setup (GskVulkanDevice *self,
+     .pNext = NULL
+   };
+ 
+-  vkGetPhysicalDeviceProperties2 (display->vk_physical_device, &vk_props);
++  display->vkGetPhysicalDeviceProperties2 (display->vk_physical_device, &vk_props);
+   gsk_gpu_device_setup (GSK_GPU_DEVICE (self),
+                         display,
+                         vk_props.properties.limits.maxImageDimension2D,
+diff --git a/gsk/gpu/gskvulkanimage.c b/gsk/gpu/gskvulkanimage.c
+index 49a7531..e0c949c 100644
+--- a/gsk/gpu/gskvulkanimage.c
++++ b/gsk/gpu/gskvulkanimage.c
+@@ -141,7 +141,7 @@ gsk_vulkan_device_get_format_features (GskVulkanDevice   *device,
+     .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+     .pNext = (tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) ? NULL : &drm_properties
+   };
+-  vkGetPhysicalDeviceFormatProperties2 (vk_phys_device,
++  gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkGetPhysicalDeviceFormatProperties2 (vk_phys_device,
+                                         format,
+                                         &properties);
+ 
+@@ -215,7 +215,7 @@ gsk_vulkan_device_supports_format (GskVulkanDevice   *device,
+   image_properties = (VkImageFormatProperties2) {
+     .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+   };
+-  res = vkGetPhysicalDeviceImageFormatProperties2 (vk_phys_device,
++  res = gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkGetPhysicalDeviceImageFormatProperties2 (vk_phys_device,
+                                                    &(VkPhysicalDeviceImageFormatInfo2) {
+                                                      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+                                                      .format = format,
+@@ -804,7 +804,7 @@ gsk_vulkan_device_check_dmabuf_format (GskVulkanDevice          *device,
+ 
+   vk_phys_device = gsk_vulkan_device_get_vk_physical_device (device);
+ 
+-  vkGetPhysicalDeviceFormatProperties2 (vk_phys_device,
++  gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkGetPhysicalDeviceFormatProperties2 (vk_phys_device,
+                                         vk_format,
+                                         &properties);
+ 
+@@ -818,7 +818,7 @@ gsk_vulkan_device_check_dmabuf_format (GskVulkanDevice          *device,
+       image_properties = (VkImageFormatProperties2) {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+       };
+-      res = vkGetPhysicalDeviceImageFormatProperties2 (vk_phys_device,
++      res = gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkGetPhysicalDeviceImageFormatProperties2 (vk_phys_device,
+                                                        &(VkPhysicalDeviceImageFormatInfo2) {
+                                                          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+                                                          .format = vk_format,
+@@ -1289,7 +1289,7 @@ gsk_vulkan_image_new_for_dmabuf (GskVulkanDevice *device,
+                                                  fd,
+                                                  &fd_props);
+ 
+-  vkGetImageMemoryRequirements2 (vk_device,
++  gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkGetImageMemoryRequirements2 (vk_device,
+                                  &(VkImageMemoryRequirementsInfo2) {
+                                      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+                                      .image = self->vk_image,
+@@ -1357,7 +1357,7 @@ gsk_vulkan_image_new_for_dmabuf (GskVulkanDevice *device,
+       return NULL;
+     }
+ 
+-  GSK_VK_CHECK (vkBindImageMemory2, gsk_vulkan_device_get_vk_device (self->device),
++  GSK_VK_CHECK (gsk_gpu_device_get_display (GSK_GPU_DEVICE (self->device))->vkBindImageMemory2, gsk_vulkan_device_get_vk_device (self->device),
+                                     1,
+                                     &(VkBindImageMemoryInfo) {
+                                         .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+@@ -1398,7 +1398,7 @@ gsk_vulkan_image_get_n_planes (GskVulkanImage *self,
+   };
+   gsize i;
+ 
+-  vkGetPhysicalDeviceFormatProperties2 (gsk_vulkan_device_get_vk_physical_device (self->device),
++  gsk_gpu_device_get_display (GSK_GPU_DEVICE (self->device))->vkGetPhysicalDeviceFormatProperties2 (gsk_vulkan_device_get_vk_physical_device (self->device),
+                                         self->vk_format,
+                                         &properties);
+   
+@@ -1653,7 +1653,7 @@ gsk_vulkan_image_new_for_d3d12resource (GskVulkanDevice *device,
+       return NULL;
+     }
+ 
+-  vkGetImageMemoryRequirements2 (vk_device,
++  gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkGetImageMemoryRequirements2 (vk_device,
+                                  &(VkImageMemoryRequirementsInfo2) {
+                                      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+                                      .image = self->vk_image,
+@@ -1695,7 +1695,7 @@ gsk_vulkan_image_new_for_d3d12resource (GskVulkanDevice *device,
+                                   NULL,
+                                   &self->allocation.vk_memory);
+ 
+-  GSK_VK_CHECK (vkBindImageMemory2, gsk_vulkan_device_get_vk_device (self->device),
++  GSK_VK_CHECK (gsk_gpu_device_get_display (GSK_GPU_DEVICE (self->device))->vkBindImageMemory2, gsk_vulkan_device_get_vk_device (self->device),
+                                     1,
+                                     &(VkBindImageMemoryInfo) {
+                                         .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+diff --git a/gsk/gpu/gskvulkanycbcr.c b/gsk/gpu/gskvulkanycbcr.c
+index dd25b1c..efec9a5 100644
+--- a/gsk/gpu/gskvulkanycbcr.c
++++ b/gsk/gpu/gskvulkanycbcr.c
+@@ -5,6 +5,9 @@
+ #include "gskgpucacheprivate.h"
+ #include "gskgpucachedprivate.h"
+ 
++/* for the display-held Vulkan 1.1 entry points (vkCreate/DestroySamplerYcbcrConversion) */
++#include "gdk/gdkdisplayprivate.h"
++
+ struct _GskVulkanYcbcr
+ {
+   GskGpuCached parent;
+@@ -68,7 +71,7 @@ gsk_vulkan_ycbcr_finalize (GskGpuCached *cached)
+   g_hash_table_remove (priv->ycbcr_cache, &self->info);
+ 
+   vkDestroySampler (vk_device, self->vk_sampler, NULL);
+-  vkDestroySamplerYcbcrConversion (vk_device, self->vk_conversion, NULL);
++  gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkDestroySamplerYcbcrConversion (vk_device, self->vk_conversion, NULL);
+   vkDestroyDescriptorSetLayout (vk_device, self->vk_descriptor_set_layout, NULL);
+   vkDestroyPipelineLayout (vk_device, self->vk_pipeline_layouts[0], NULL);
+   vkDestroyPipelineLayout (vk_device, self->vk_pipeline_layouts[1], NULL);
+@@ -167,7 +170,7 @@ gsk_vulkan_ycbcr_get (GskVulkanDevice          *device,
+   self->info = *info;
+ 
+   vk_chroma = gsk_vulkan_ycbcr_get_best_vk_chroma (info->vk_features);
+-  GSK_VK_CHECK (vkCreateSamplerYcbcrConversion, vk_device,
++  GSK_VK_CHECK (gsk_gpu_device_get_display (GSK_GPU_DEVICE (device))->vkCreateSamplerYcbcrConversion, vk_device,
+                                                 &(VkSamplerYcbcrConversionCreateInfo) {
+                                                     .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO,
+                                                     .format = self->info.vk_format,
+-- 
+2.50.1
+

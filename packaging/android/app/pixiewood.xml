@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Pixiewood manifest for the renderer-benchmark demo. Run from the repo root
+     (where meson.build lives). Built against the API-26 + Vulkan gdk-android
+     patches in packaging/android/gtk/ (applied via the <gtk> entries below) and
+     the api26 branch of the gtk-android-builder fork (lowers minSdk + weak NDK
+     symbols), so the same APK runs Vulkan on API 28+ and GL on Android 8-9. -->
+<app xmlns="https://sp1rit.arpa/pixiewood/" xmlns:xi="http://www.w3.org/2001/XInclude">
+	<metainfo vercalc="count">
+		<xi:include href="src://packaging/android/app/space.ampernic.GtkVulkanDemo.metainfo.xml" parse="xml"/>
+	</metainfo>
+	<style>
+		<theme name="adw"/>
+		<icon type="generate">
+			<drawable target="foreground" type="avd" path="src://packaging/android/app/foreground.xml"/>
+			<color target="background">#1C71D8</color>
+		</icon>
+	</style>
+	<dependencies>
+		<glib>
+			<patch>hack</patch>
+		</glib>
+		<!-- glib hard-requires iconv; Bionic only ships it from API 28, so provide
+		     GNU libiconv for the minSdk-26 build (wrap injected in android.yml). -->
+		<iconv/>
+		<fontconfig/>
+		<gtk>
+			<!-- API 26 + Vulkan support for gdk-android (see each patch header). -->
+			<patch>android-input-jni</patch>
+			<patch>android-choreographer-fallback</patch>
+			<patch>android-clipboard-lazy-manager</patch>
+			<patch>android-window-insets-pre30</patch>
+			<patch>android-vulkan-procaddr-pre28</patch>
+			<patch>android-vulkan-backend</patch>
+			<patch>android-vulkan-primary</patch>
+		</gtk>
+		<libadwaita/>
+	</dependencies>
+	<build target="gtk-vulkan-demo">
+		<configure-options>
+			<option>-Diconv:default_library=static</option>
+			<option>-Dgdk-pixbuf:android=disabled</option>
+			<!-- the whole point: Vulkan renderer enabled (the patches make it link
+			     on minSdk 26 and add the gdk-android WSI backend). -->
+			<option>-Dgtk:vulkan=enabled</option>
+		</configure-options>
+		<architectures>
+			<arch>aarch64</arch>
+			<arch>x86_64</arch>
+		</architectures>
+	</build>
+</app>

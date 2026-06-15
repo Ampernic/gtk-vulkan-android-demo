@@ -1,0 +1,229 @@
+From 21a93f21ca171d5aa1239abf5db441b1ebce2b19 Mon Sep 17 00:00:00 2001
+From: Ampernic <ampernic@inbox.ru>
+Date: Mon, 15 Jun 2026 12:24:57 +0300
+Subject: [PATCH] gdk/android: pre-30 fallbacks for the window-insets glue +
+ clipboard prime
+
+ToplevelActivity used API-30 window APIs unconditionally
+(setDecorFitsSystemWindows, WindowInsetsController, WindowInsets.Type,
+Insets, onApplyWindowInsets), crashing on Android 8-9. Gate each on
+SDK_INT >= R with pre-30 fallbacks (systemUiVisibility flags,
+getSystemWindowInset*/consumeSystemWindowInsets, int inset fields,
+InputMethodManager for IME).
+
+Also construct the ClipboardManager in onCreate (UI thread): below API 30
+its constructor makes a Handler bound to the current thread's Looper, but
+the GDK clipboard backend fetches it from the GTK thread (no Looper) and
+crashed (Can't create handler ...). Priming the per-context cache on the
+UI thread lets the GTK-thread getSystemService reuse the instance.
+---
+ .../org/gtk/android/ToplevelActivity.java     | 128 ++++++++++++++----
+ 1 file changed, 98 insertions(+), 30 deletions(-)
+
+diff --git a/gdk/android/glue/java/org/gtk/android/ToplevelActivity.java b/gdk/android/glue/java/org/gtk/android/ToplevelActivity.java
+index 09889b9..eed6c39 100644
+--- a/gdk/android/glue/java/org/gtk/android/ToplevelActivity.java
++++ b/gdk/android/glue/java/org/gtk/android/ToplevelActivity.java
+@@ -23,6 +23,7 @@ import android.annotation.SuppressLint;
+ import android.app.Activity;
+ import android.app.ActivityManager;
+ import android.content.ClipData;
++import android.content.ClipboardManager;
+ import android.content.Intent;
+ import android.content.pm.ActivityInfo;
+ import android.content.res.Configuration;
+@@ -145,14 +146,25 @@ public class ToplevelActivity extends Activity {
+ 					boolean imeKeyboardState = queuedImeKeyboardState > 0;
+ 					queuedImeKeyboardState = 0;
+ 					runOnUiThread(() -> {
+-						WindowInsetsController controller = getWindowInsetsController();
+-						if (imeKeyboardState) {
+-							requestFocus();
+-							if (controller != null)
+-								controller.show(WindowInsets.Type.ime());
+-						 } else if (controller != null) {
+-							controller.hide(WindowInsets.Type.ime());
+-						 }
++						if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++							WindowInsetsController controller = getWindowInsetsController();
++							if (imeKeyboardState) {
++								requestFocus();
++								if (controller != null)
++									controller.show(WindowInsets.Type.ime());
++							 } else if (controller != null) {
++								controller.hide(WindowInsets.Type.ime());
++							 }
++						} else {
++							InputMethodManager imm = getContext().getSystemService(InputMethodManager.class);
++							if (imeKeyboardState) {
++								requestFocus();
++								if (imm != null)
++									imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT);
++							} else if (imm != null) {
++								imm.hideSoftInputFromWindow(getWindowToken(), 0);
++							}
++						}
+ 					});
+ 				});
+ 			}
+@@ -305,8 +317,8 @@ public class ToplevelActivity extends Activity {
+ 			protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+ 				if (changed)
+ 					GlibContext.runOnMain(() -> notifyLayoutPosition(
+-						left - ToplevelView.this.insets.left,
+-						top - ToplevelView.this.insets.top
++						left - ToplevelView.this.insetLeft,
++						top - ToplevelView.this.insetTop
+ 					));
+ 				super.onLayout(changed, left, top, right, bottom);
+ 			}
+@@ -347,7 +359,9 @@ public class ToplevelActivity extends Activity {
+ 		public Surface toplevel;
+ 		private Surface grabbed;
+ 
+-		private Insets insets = Insets.NONE;
++		// Stored as ints rather than android.graphics.Insets (API 29) so the field
++		// initializer does not pull in a >API-26 class on older devices.
++		private int insetLeft = 0, insetTop = 0, insetRight = 0, insetBottom = 0;
+ 
+ 		public ToplevelView() {
+ 			super(ToplevelActivity.this);
+@@ -361,8 +375,8 @@ public class ToplevelActivity extends Activity {
+ 			}
+ 
+ 			measureChildren(
+-				widthMeasureSpec - (insets.left + insets.right),
+-				heightMeasureSpec - (insets.top + insets.bottom)
++				widthMeasureSpec - (insetLeft + insetRight),
++				heightMeasureSpec - (insetTop + insetBottom)
+ 			);
+ 			setMeasuredDimension(widthMeasureSpec, heightMeasureSpec);
+ 		}
+@@ -376,10 +390,10 @@ public class ToplevelActivity extends Activity {
+ 				if (child.getVisibility() != GONE) {
+ 					LayoutParams lp = (LayoutParams)child.getLayoutParams();
+ 					child.layout(
+-						l + lp.x + insets.left,
+-						t + lp.y + insets.top,
+-						l + lp.x + insets.left + child.getMeasuredWidth(),
+-						t + lp.y + insets.top + child.getMeasuredHeight()
++						l + lp.x + insetLeft,
++						t + lp.y + insetTop,
++						l + lp.x + insetLeft + child.getMeasuredWidth(),
++						t + lp.y + insetTop + child.getMeasuredHeight()
+ 					);
+ 				}
+ 			}
+@@ -392,9 +406,24 @@ public class ToplevelActivity extends Activity {
+ 
+ 		@Override
+ 		public WindowInsets onApplyWindowInsets(WindowInsets insets) {
+-			this.insets = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
+-			requestLayout();
+-			return WindowInsets.CONSUMED;
++			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++				Insets in = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
++				this.insetLeft = in.left;
++				this.insetTop = in.top;
++				this.insetRight = in.right;
++				this.insetBottom = in.bottom;
++				requestLayout();
++				return WindowInsets.CONSUMED;
++			} else {
++				// Pre-30: Insets / WindowInsets.Type / CONSUMED don't exist; use the
++				// deprecated system-window inset accessors (API 20).
++				this.insetLeft = insets.getSystemWindowInsetLeft();
++				this.insetTop = insets.getSystemWindowInsetTop();
++				this.insetRight = insets.getSystemWindowInsetRight();
++				this.insetBottom = insets.getSystemWindowInsetBottom();
++				requestLayout();
++				return insets.consumeSystemWindowInsets();
++			}
+ 		}
+ 
+ 		public void setGrabbedSurface(@Nullable Surface grabbed) {
+@@ -438,7 +467,22 @@ public class ToplevelActivity extends Activity {
+ 
+ 		super.onCreate(savedInstanceState);
+ 		setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER);
+-		getWindow().setDecorFitsSystemWindows(false);
++
++		// Construct the ClipboardManager here, on the UI thread: below API 30 its
++		// constructor creates an android.os.Handler bound to the calling thread's
++		// Looper. The GDK clipboard backend fetches it from the GTK thread (no
++		// Looper) — which would crash — so prime the per-context cache now, while a
++		// Looper exists; the later getSystemService on the GTK thread reuses it.
++		getSystemService(ClipboardManager.class);
++
++		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++			getWindow().setDecorFitsSystemWindows(false);
++		} else {
++			getWindow().getDecorView().setSystemUiVisibility(
++					View.SYSTEM_UI_FLAG_LAYOUT_STABLE
++					| View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
++					| View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
++		}
+ 
+ 		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+ 			this.defaultBack = new OnBackInvokedCallback() {
+@@ -556,7 +600,6 @@ public class ToplevelActivity extends Activity {
+ 	public void postWindowConfiguration(int color, boolean fullscreen) {
+ 		runOnUiThread(() -> {
+ 			Window window = getWindow();
+-			WindowInsetsController controller = window.getInsetsController();
+ 
+ 			view.setBackgroundColor(color);
+ 			// Taken from SO: https://stackoverflow.com/a/3943023
+@@ -565,16 +608,41 @@ public class ToplevelActivity extends Activity {
+ 			                   ((color >>  8) & 0xFF) * 0.587 +
+ 			                   ((color >>  0) & 0xFF) * 0.114) > 186;
+ 
+-			int bars = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+-			controller.setSystemBarsAppearance(dark_fg ? bars : 0, bars);
+-
+ 			this.fullscreenState = fullscreen;
+-			if (fullscreen) {
+-				controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+-				controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
++			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++				WindowInsetsController controller = window.getInsetsController();
++
++				int bars = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
++				controller.setSystemBarsAppearance(dark_fg ? bars : 0, bars);
++
++				if (fullscreen) {
++					controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
++					controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
++				} else {
++					controller.show(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
++					controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_DEFAULT);
++				}
+ 			} else {
+-				controller.show(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+-				controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_DEFAULT);
++				// Pre-30 (API 26-29): the WindowInsetsController API is unavailable;
++				// drive the system bars through the deprecated systemUiVisibility flags.
++				View decor = window.getDecorView();
++				int vis = decor.getSystemUiVisibility();
++
++				int light = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
++				if (dark_fg)
++					vis |= light;
++				else
++					vis &= ~light;
++
++				int immersive = View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
++						| View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
++						| View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
++				if (fullscreen)
++					vis |= immersive;
++				else
++					vis &= ~(View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
++
++				decor.setSystemUiVisibility(vis);
+ 			}
+ 			updateToplevelState();
+ 		});
+-- 
+2.50.1
+

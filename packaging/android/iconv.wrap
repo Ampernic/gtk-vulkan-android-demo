@@ -1,0 +1,12 @@
+# glib hard-requires iconv, but Bionic only ships it from API 28. For our minSdk
+# 26 (Android 8.0) build, provide GNU libiconv as a subproject so glib's
+# dependency('iconv') resolves to it. Frida maintains a meson-buildable libiconv.
+# It declares libiconv_dep and overrides the name "libiconv"; map it to the name
+# glib actually asks for ("iconv") via [provide]. Needs gperf at build time.
+[wrap-git]
+directory = libiconv
+url = https://github.com/frida/libiconv.git
+revision = bbbf4561da4847bf95ce9458da76e072b77cabd1
+
+[provide]
+iconv = libiconv_dep

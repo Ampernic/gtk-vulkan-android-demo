@@ -1,0 +1,220 @@
+From ba90d5bef88cedead10eaf6320a2e8e53d3d460f Mon Sep 17 00:00:00 2001
+From: Ampernic <ampernic@inbox.ru>
+Date: Mon, 15 Jun 2026 15:22:53 +0300
+Subject: [PATCH] gdk/android: add a Vulkan WSI backend
+ (GdkAndroidVulkanContext)
+
+gdk-android only provided a GL context, so GTK always fell back to the GL
+renderer on Android even on hardware with full Vulkan support. Add a
+GdkVulkanContext implementation whose create_surface builds a VkSurfaceKHR
+from the surface's ANativeWindow via vkCreateAndroidSurfaceKHR, and wire it
+into GdkAndroidDisplay (vk_context_type + VK_KHR_android_surface instance
+extension). The generic GdkVulkanContext drives swapchain/present. Guarded
+by GDK_RENDERING_VULKAN; the GL path is unchanged when Vulkan is off or the
+surface has no native window yet (returns VK_ERROR_SURFACE_LOST_KHR).
+---
+ gdk/android/gdkandroiddisplay.c               | 12 +++
+ gdk/android/gdkandroidvulkancontext-private.h | 53 +++++++++++++
+ gdk/android/gdkandroidvulkancontext.c         | 78 +++++++++++++++++++
+ gdk/android/meson.build                       |  1 +
+ 4 files changed, 144 insertions(+)
+ create mode 100644 gdk/android/gdkandroidvulkancontext-private.h
+ create mode 100644 gdk/android/gdkandroidvulkancontext.c
+
+diff --git a/gdk/android/gdkandroiddisplay.c b/gdk/android/gdkandroiddisplay.c
+index 74df7fa..69ed117 100644
+--- a/gdk/android/gdkandroiddisplay.c
++++ b/gdk/android/gdkandroiddisplay.c
+@@ -19,6 +19,10 @@
+ 
+ #include "config.h"
+ 
++/* Expose VK_KHR_android_surface (vulkan_android.h) before any header pulls in
++ * vulkan.h, so VK_KHR_ANDROID_SURFACE_EXTENSION_NAME is available below. */
++#define VK_USE_PLATFORM_ANDROID_KHR
++
+ #include "gdkdisplayprivate.h"
+ #include "gdkeventsprivate.h"
+ #include "gdkframeclockprivate.h"
+@@ -34,6 +38,9 @@
+ #include "gdkandroiddevice-private.h"
+ #include "gdkandroidkeymap-private.h"
+ #include "gdkandroidglcontext-private.h"
++#ifdef GDK_RENDERING_VULKAN
++#include "gdkandroidvulkancontext-private.h"
++#endif
+ 
+ #include "gdkandroiddisplay-private.h"
+ 
+@@ -255,8 +262,13 @@ gdk_android_display_class_init (GdkAndroidDisplayClass *klass)
+   display_class->toplevel_type = GDK_TYPE_ANDROID_TOPLEVEL;
+   display_class->popup_type = GDK_TYPE_ANDROID_POPUP;
+   display_class->cairo_context_type = GDK_TYPE_ANDROID_CAIRO_CONTEXT;
++#ifdef GDK_RENDERING_VULKAN
++  display_class->vk_context_type = GDK_TYPE_ANDROID_VULKAN_CONTEXT;
++  display_class->vk_extension_name = VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
++#else
+   display_class->vk_context_type = G_TYPE_NONE;
+   display_class->vk_extension_name = NULL;
++#endif
+ 
+   display_class->get_name = gdk_android_display_get_name;
+   display_class->beep = gdk_android_display_beep;
+diff --git a/gdk/android/gdkandroidvulkancontext-private.h b/gdk/android/gdkandroidvulkancontext-private.h
+new file mode 100644
+index 0000000..ec49241
+--- /dev/null
++++ b/gdk/android/gdkandroidvulkancontext-private.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright (c) 2026 Anton Politov
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see <http://www.gnu.org/licenses/>.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#pragma once
++
++#include "gdkconfig.h"
++
++#ifdef GDK_RENDERING_VULKAN
++
++#define VK_USE_PLATFORM_ANDROID_KHR
++
++#include "gdkvulkancontextprivate.h"
++
++G_BEGIN_DECLS
++
++#define GDK_TYPE_ANDROID_VULKAN_CONTEXT     (gdk_android_vulkan_context_get_type ())
++#define GDK_ANDROID_VULKAN_CONTEXT(obj)     (G_TYPE_CHECK_INSTANCE_CAST ((obj), GDK_TYPE_ANDROID_VULKAN_CONTEXT, GdkAndroidVulkanContext))
++#define GDK_IS_ANDROID_VULKAN_CONTEXT(obj)  (G_TYPE_CHECK_INSTANCE_TYPE ((obj), GDK_TYPE_ANDROID_VULKAN_CONTEXT))
++
++typedef struct _GdkAndroidVulkanContext GdkAndroidVulkanContext;
++typedef struct _GdkAndroidVulkanContextClass GdkAndroidVulkanContextClass;
++
++struct _GdkAndroidVulkanContext
++{
++  GdkVulkanContext parent_instance;
++};
++
++struct _GdkAndroidVulkanContextClass
++{
++  GdkVulkanContextClass parent_class;
++};
++
++GType gdk_android_vulkan_context_get_type (void) G_GNUC_CONST;
++
++G_END_DECLS
++
++#endif /* GDK_RENDERING_VULKAN */
+diff --git a/gdk/android/gdkandroidvulkancontext.c b/gdk/android/gdkandroidvulkancontext.c
+new file mode 100644
+index 0000000..a12b371
+--- /dev/null
++++ b/gdk/android/gdkandroidvulkancontext.c
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (c) 2026 Anton Politov
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see <http://www.gnu.org/licenses/>.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++
++#include "config.h"
++
++#include "gdkconfig.h"
++
++#ifdef GDK_RENDERING_VULKAN
++
++#include "gdkandroidvulkancontext-private.h"
++
++#include "gdkandroidsurface-private.h"
++
++G_DEFINE_TYPE (GdkAndroidVulkanContext, gdk_android_vulkan_context, GDK_TYPE_VULKAN_CONTEXT)
++
++static VkResult
++gdk_android_vulkan_context_create_surface (GdkVulkanContext *context,
++                                           VkSurfaceKHR     *vr_surface)
++{
++  GdkSurface *surface = gdk_draw_context_get_surface (GDK_DRAW_CONTEXT (context));
++  GdkAndroidSurface *android_surface = GDK_ANDROID_SURFACE (surface);
++  VkResult res;
++
++  /* The ANativeWindow is (re)bound on visibility changes from the UI thread; hold
++   * the same lock the surface uses while we hand it to Vulkan. */
++  g_mutex_lock (&android_surface->native_lock);
++
++  if (android_surface->native == NULL)
++    {
++      g_mutex_unlock (&android_surface->native_lock);
++      return VK_ERROR_SURFACE_LOST_KHR;
++    }
++
++  res = GDK_VK_CHECK (vkCreateAndroidSurfaceKHR, gdk_vulkan_context_get_instance (context),
++                                                 &(VkAndroidSurfaceCreateInfoKHR) {
++                                                     .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
++                                                     .pNext = NULL,
++                                                     .flags = 0,
++                                                     .window = android_surface->native
++                                                 },
++                                                 NULL,
++                                                 vr_surface);
++
++  g_mutex_unlock (&android_surface->native_lock);
++
++  return res;
++}
++
++static void
++gdk_android_vulkan_context_class_init (GdkAndroidVulkanContextClass *klass)
++{
++  GdkVulkanContextClass *vulkan_context_class = GDK_VULKAN_CONTEXT_CLASS (klass);
++
++  vulkan_context_class->create_surface = gdk_android_vulkan_context_create_surface;
++}
++
++static void
++gdk_android_vulkan_context_init (GdkAndroidVulkanContext *self)
++{
++}
++
++#endif /* GDK_RENDERING_VULKAN */
+diff --git a/gdk/android/meson.build b/gdk/android/meson.build
+index f0a57ea..e50c16d 100644
+--- a/gdk/android/meson.build
++++ b/gdk/android/meson.build
+@@ -11,6 +11,7 @@ gdk_android_sources = files([
+   'gdkandroidclipboard.c',
+   'gdkandroiddnd.c',
+   'gdkandroidglcontext.c',
++  'gdkandroidvulkancontext.c',
+   'gdkandroidseat.c',
+   'gdkandroiddevice.c',
+   'gdkandroidkeymap.c',
+-- 
+2.50.1
+

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>space.ampernic.GtkVulkanDemo</id>
+  <name>GTK Renderer Benchmark</name>
+  <summary>Compare the Vulkan, OpenGL and Cairo GSK renderers</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LGPL-3.0-or-later</project_license>
+  <description>
+    <p>
+      A small benchmark that renders a heavy 3D scene off-screen with each GSK
+      renderer and reports the real per-frame cost, so you can compare Vulkan,
+      OpenGL and Cairo on the same hardware.
+    </p>
+  </description>
+  <launchable type="desktop-id">space.ampernic.GtkVulkanDemo.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-06-15"/>
+  </releases>
+</component>

@@ -1,0 +1,151 @@
+From 3fa3e6185fd4811bc5faba5dc6a66f8403047e20 Mon Sep 17 00:00:00 2001
+From: Ampernic <ampernic@inbox.ru>
+Date: Mon, 15 Jun 2026 11:43:59 +0300
+Subject: [PATCH] gdk/android: acquire the clipboard manager lazily
+
+getSystemService(CLIPBOARD_SERVICE) only returns the manager from an
+activity context. The clipboard is constructed during display open, when
+the current context is still the application (the runtime sets the app as
+the "activity" at startup, before a ToplevelActivity is bound), so the
+eager fetch in _init returned NULL and the immediate add_change_listener
+call aborted the VM with "obj == null" on Android 8. Defer the fetch to
+the first clipboard use and retry until an activity context is current.
+---
+ gdk/android/gdkandroidclipboard.c | 73 ++++++++++++++++++++++++++-----
+ 1 file changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/gdk/android/gdkandroidclipboard.c b/gdk/android/gdkandroidclipboard.c
+index d108b5a..774c35f 100644
+--- a/gdk/android/gdkandroidclipboard.c
++++ b/gdk/android/gdkandroidclipboard.c
+@@ -27,6 +27,8 @@
+ 
+ #include "gdkandroidclipboard-private.h"
+ 
++static gboolean gdk_android_clipboard_ensure_manager (GdkAndroidClipboard *self);
++
+ void
+ _gdk_android_clipboard_on_clipboard_changed (JNIEnv *env, jobject this)
+ {
+@@ -50,12 +52,16 @@ gdk_android_clipboard_finalize (GObject *object)
+   GdkAndroidClipboard *self = (GdkAndroidClipboard *) object;
+ 
+   JNIEnv *env = gdk_android_get_env ();
+-  (*env)->SetLongField (env, self->listener,
+-                        gdk_android_get_java_cache ()->clipboard_provider_change_listener.native_ptr,
+-                        0);
+-  (*env)->CallVoidMethod (env, self->manager,
+-                          gdk_android_get_java_cache ()->a_clipboard_manager.remove_change_listener,
+-                          self->listener);
++  if (self->listener != NULL)
++    {
++      (*env)->SetLongField (env, self->listener,
++                            gdk_android_get_java_cache ()->clipboard_provider_change_listener.native_ptr,
++                            0);
++      if (self->manager != NULL)
++        (*env)->CallVoidMethod (env, self->manager,
++                                gdk_android_get_java_cache ()->a_clipboard_manager.remove_change_listener,
++                                self->listener);
++    }
+   (*env)->DeleteGlobalRef (env, self->listener);
+   (*env)->DeleteGlobalRef (env, self->manager);
+ 
+@@ -442,6 +448,12 @@ gdk_android_clipboard_send_to_remote (GdkAndroidClipboard *self,
+                                       GdkContentFormats   *formats,
+                                       GdkContentProvider  *content)
+ {
++  if (!gdk_android_clipboard_ensure_manager (self))
++    {
++      g_warning ("Cannot publish to the system clipboard: no manager (no activity context yet)");
++      return;
++    }
++
+   if (self->cancellable)
+     {
+       g_cancellable_cancel (self->cancellable);
+@@ -637,6 +649,14 @@ gdk_android_clipboard_read_async (GdkClipboard       *clipboard,
+ {
+   GdkAndroidClipboard *self = (GdkAndroidClipboard *) clipboard;
+ 
++  if (!gdk_android_clipboard_ensure_manager (self))
++    {
++      g_task_report_new_error (clipboard, callback, user_data, gdk_android_clipboard_read_async,
++                               G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
++                               "Unable to access clipboard data");
++      return;
++    }
++
+   GTask *task = g_task_new (clipboard, cancellable, callback, user_data);
+   g_task_set_source_tag (task, gdk_android_clipboard_read_async);
+   g_task_set_priority (task, io_priority);
+@@ -696,16 +716,36 @@ gdk_android_clipboard_class_init (GdkAndroidClipboardClass *klass)
+   clipboard_class->read_finish = gdk_android_clipboard_read_finish;
+ }
+ 
+-static void
+-gdk_android_clipboard_init (GdkAndroidClipboard *self)
++/* Lazily acquire the Android ClipboardManager and register the change listener.
++ *
++ * getSystemService(CLIPBOARD_SERVICE) only returns the manager from an activity
++ * context; at display-open time (when the clipboard object is constructed) the
++ * current context is still the application (see gdk_android_set_latest_activity in
++ * the runtime start: "thiz isn't actually an activity"), so an early fetch yields
++ * NULL on older Android. A real ToplevelActivity is bound shortly after, so we
++ * defer the fetch to the first actual clipboard use and retry until it succeeds.
++ *
++ * Runs on the GTK thread, like every other clipboard entry point, so no locking. */
++static gboolean
++gdk_android_clipboard_ensure_manager (GdkAndroidClipboard *self)
+ {
+-  self->cancellable = NULL;
++  if (self->manager != NULL)
++    return TRUE;
++
++  jobject context = gdk_android_get_activity ();
++  if (context == NULL)
++    return FALSE;
+ 
+   JNIEnv *env = gdk_android_get_env ();
+   (*env)->PushLocalFrame (env, 2);
+-  jobject clipboard_mgr = (*env)->CallObjectMethod (env, gdk_android_get_activity (),
++  jobject clipboard_mgr = (*env)->CallObjectMethod (env, context,
+                                                     gdk_android_get_java_cache ()->a_context.get_system_service,
+                                                     gdk_android_get_java_cache ()->a_context.clipboard_service);
++  if (clipboard_mgr == NULL)
++    {
++      (*env)->PopLocalFrame (env, NULL);
++      return FALSE;
++    }
+   self->manager = (*env)->NewGlobalRef (env, clipboard_mgr);
+ 
+   jobject listener = (*env)->NewObject (env, gdk_android_get_java_cache ()->clipboard_provider_change_listener.klass,
+@@ -718,6 +758,16 @@ gdk_android_clipboard_init (GdkAndroidClipboard *self)
+   (*env)->PopLocalFrame (env, NULL);
+ 
+   gdk_android_clipboard_update_remote_formats (self);
++  return TRUE;
++}
++
++static void
++gdk_android_clipboard_init (GdkAndroidClipboard *self)
++{
++  self->cancellable = NULL;
++  self->manager = NULL;
++  self->listener = NULL;
++  /* manager/listener are set up lazily, see gdk_android_clipboard_ensure_manager */
+ }
+ 
+ GdkClipboard *
+@@ -761,6 +811,9 @@ gdk_android_clipboard_description_to_formats (jobject clipdesc)
+ void
+ gdk_android_clipboard_update_remote_formats (GdkAndroidClipboard *self)
+ {
++  if (!gdk_android_clipboard_ensure_manager (self))
++    return;
++
+   JNIEnv *env = gdk_android_get_env ();
+   (*env)->PushLocalFrame (env, 1);
+   jobject desc = (*env)->CallObjectMethod (env, self->manager,
+-- 
+2.50.1
+

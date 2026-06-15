@@ -1,0 +1,110 @@
+name: Android
+
+# Builds the demo as an Android APK with Pixiewood, against the API-26 + Vulkan
+# gdk-android patches (packaging/android/gtk/) and the api26 branch of the
+# gtk-android-builder fork. The resulting APK runs the Vulkan renderer on
+# API 28+ and falls back to GL on Android 8-9.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/ndk || true
+
+      - name: Host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build glslc gperf libxml2-utils python3 \
+            openjdk-17-jdk-headless gir1.2-appstream-1.0 \
+            libglib-perl libglib-object-introspection-perl libipc-run-perl \
+            libjson-perl libset-scalar-perl libxml-libxml-perl libxml-libxslt-perl
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK + platform + build-tools
+        run: |
+          yes | sdkmanager --install \
+            "platform-tools" "platforms;android-26" \
+            "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1" >/dev/null
+
+      - name: Forked meson + Pixiewood (api26 fork)
+        run: |
+          git clone --depth 1 -b android-apk https://github.com/sp1ritCS/meson "$RUNNER_TEMP/meson"
+          # the api26 branch already targets minSdk 26 + weak NDK symbols, so no
+          # android.cross / gradle.xsl seds are needed here.
+          git clone --depth 1 -b api26 https://github.com/Ampernic/gtk-android-builder "$RUNNER_TEMP/pw"
+          # pin GTK to the commit the gdk-android patches apply against
+          sed -i 's|^revision = main|revision = 33f9bc7bc5653e9214226e44758ae74967d8c0b6|' \
+            "$RUNNER_TEMP/pw/prepare/wraps/gtk/gtk.wrap"
+          cp packaging/android/gtk/*.patch "$RUNNER_TEMP/pw/prepare/wraps/gtk/"
+          # glib needs iconv, absent from Bionic below API 28; supply GNU libiconv
+          mkdir -p "$RUNNER_TEMP/pw/prepare/wraps/iconv"
+          cp packaging/android/iconv.wrap "$RUNNER_TEMP/pw/prepare/wraps/iconv/iconv.wrap"
+          # Pixiewood needs the forked meson (only it understands android_exe_type)
+          printf '#!/bin/sh\nexec python3 "%s/meson.py" "$@"\n' "$RUNNER_TEMP/meson" \
+            | sudo tee /usr/local/bin/meson >/dev/null
+          sudo chmod +x /usr/local/bin/meson
+          meson --version
+
+      - name: Build APK (Pixiewood)
+        run: |
+          set -x
+          PW="$RUNNER_TEMP/pw/pixiewood"
+          # run from the repo root so the manifest's src:// paths resolve
+          perl "$PW" prepare packaging/android/app/pixiewood.xml \
+            --sdk "$ANDROID_HOME" \
+            --android-studio-dir "$ANDROID_HOME" \
+            --meson /usr/local/bin/meson -v
+          perl "$PW" generate -v
+          # GTK dlopen()s its native .so by path, so unpack them on install
+          APP=.pixiewood/android/app
+          if [ -f "$APP/build.gradle" ]; then
+            printf '\nandroid { packagingOptions { jniLibs { useLegacyPackaging true } } }\n' >> "$APP/build.gradle"
+          elif [ -f "$APP/build.gradle.kts" ]; then
+            printf '\nandroid { packaging { jniLibs { useLegacyPackaging = true } } }\n' >> "$APP/build.gradle.kts"
+          fi
+          perl "$PW" build
+
+      - name: Collect APKs
+        if: always()
+        run: |
+          mkdir -p apks
+          for apk in $(find .pixiewood -name '*.apk' ! -name '*-unsigned.apk'); do
+            case "$apk" in
+              *arm64-v8a*) abi=arm64-v8a ;;
+              *x86_64*)    abi=x86_64 ;;
+              *universal*) abi=universal ;;
+              *)           abi=universal ;;
+            esac
+            cp -v "$apk" "apks/GtkVulkanDemo-android-$abi.apk"
+          done
+          ls -la apks/ || true
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gtk-vulkan-demo-android
+          path: apks/*.apk
+          if-no-files-found: warn
