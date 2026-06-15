@@ -14,31 +14,6 @@
 #include <adwaita.h>
 #include <math.h>
 
-#ifdef __ANDROID__
-#include <android/log.h>
-
-/* GLib's default log writer sends g_warning()/g_critical() to stderr, which is
- * discarded on Android - so GSK's own Vulkan diagnostics (e.g. a failed
- * vkCreateGraphicsPipelines) never reach logcat. Route them to the Android log. */
-static GLogWriterOutput
-android_log_writer (GLogLevelFlags level, const GLogField *fields, gsize n, gpointer u)
-{
-  const char *msg = NULL, *dom = NULL;
-  for (gsize i = 0; i < n; i++)
-    {
-      if (g_strcmp0 (fields[i].key, "MESSAGE") == 0) msg = fields[i].value;
-      else if (g_strcmp0 (fields[i].key, "GLIB_DOMAIN") == 0) dom = fields[i].value;
-    }
-  int prio = (level & G_LOG_LEVEL_ERROR)    ? ANDROID_LOG_FATAL
-           : (level & G_LOG_LEVEL_CRITICAL) ? ANDROID_LOG_ERROR
-           : (level & G_LOG_LEVEL_WARNING)  ? ANDROID_LOG_WARN
-           : (level & G_LOG_LEVEL_DEBUG)    ? ANDROID_LOG_DEBUG
-           : ANDROID_LOG_INFO;
-  __android_log_print (prio, dom ? dom : "GtkVulkanDemo", "%s", msg ? msg : "(null)");
-  return G_LOG_WRITER_HANDLED;
-}
-#endif
-
 #define BENCH 720            /* fixed off-screen render resolution (consistent metric) */
 
 /* ---- a single cog/gear drawn once into a texture ---------------------- */
@@ -247,9 +222,11 @@ gears_view_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
 {
   GearsView *self = GEARS_VIEW (widget);
   int w = gtk_widget_get_width (widget), h = gtk_widget_get_height (widget);
-  if (self->frame)
-    gtk_snapshot_append_texture (snapshot, self->frame,
-                                 &GRAPHENE_RECT_INIT (0, 0, (float) w, (float) h));
+  /* Draw the scene live with the window's own renderer. No per-frame textures
+   * are created or retained, so nothing accumulates in the renderer's texture
+   * cache. The Cairo selection is shown flat (Cairo has no 3D); GL/Vulkan 3D. */
+  gboolean flat = self->backend == 2;
+  build_scene (snapshot, w, h, self->gear, self->angle, self->density, self->blur, flat);
 }
 
 static gboolean
@@ -259,41 +236,32 @@ gears_view_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
 
   if (self->backend < 0)
     gears_view_set_backend (self, 0);   /* prefer Vulkan; falls back to GL */
-  if (!self->renderer)
-    return G_SOURCE_CONTINUE;
 
-  /* build the scene and render it off-screen with the chosen renderer; the
-   * Cairo (software) renderer has no 3D, so feed it the flat variant */
-  gboolean flat = renderer_backend (self->renderer) == 2;
-  GtkSnapshot *s = gtk_snapshot_new ();
-  build_scene (s, BENCH, BENCH, self->gear, self->angle, self->density, self->blur, flat);
-  GskRenderNode *node = gtk_snapshot_free_to_node (s);
-  if (node)
+  /* Benchmark only: render the scene off-screen with the chosen renderer, force
+   * it to complete (download), time it, then drop the texture immediately. The
+   * on-screen display above is independent, so nothing is retained per frame. */
+  if (self->renderer)
     {
-      gint64 t0 = g_get_monotonic_time ();
-      GdkTexture *tex = gsk_renderer_render_texture (self->renderer, node,
-                                                     &GRAPHENE_RECT_INIT (0, 0, BENCH, BENCH));
-      /* download forces the render to actually complete (otherwise GL/Vulkan
-       * just queue the work and the timing would be meaningless) */
-      if (self->dlbuf == NULL)
-        self->dlbuf = g_malloc ((gsize) BENCH * BENCH * 4);
-      gdk_texture_download (tex, self->dlbuf, BENCH * 4);
-      gint64 t1 = g_get_monotonic_time ();
+      gboolean flat = renderer_backend (self->renderer) == 2;
+      GtkSnapshot *s = gtk_snapshot_new ();
+      build_scene (s, BENCH, BENCH, self->gear, self->angle, self->density, self->blur, flat);
+      GskRenderNode *node = gtk_snapshot_free_to_node (s);
+      if (node)
+        {
+          gint64 t0 = g_get_monotonic_time ();
+          GdkTexture *tex = gsk_renderer_render_texture (self->renderer, node,
+                                                         &GRAPHENE_RECT_INIT (0, 0, BENCH, BENCH));
+          if (self->dlbuf == NULL)
+            self->dlbuf = g_malloc ((gsize) BENCH * BENCH * 4);
+          gdk_texture_download (tex, self->dlbuf, BENCH * 4);   /* force GPU completion */
+          gint64 t1 = g_get_monotonic_time ();
 
-      double ms = (t1 - t0) / 1000.0;
-      self->render_ms = self->render_ms == 0 ? ms : self->render_ms * 0.85 + ms * 0.15;
+          double ms = (t1 - t0) / 1000.0;
+          self->render_ms = self->render_ms == 0 ? ms : self->render_ms * 0.85 + ms * 0.15;
 
-      /* Display the downloaded pixels as a CPU texture and release the GPU
-       * texture immediately. Keeping the off-screen renderer's GPU texture and
-       * compositing it with the window's (different) renderer pins one BENCH
-       * texture per frame - a ~2MB/frame leak the OOM killer eventually reaps. */
-      g_clear_object (&self->frame);
-      GBytes *bytes = g_bytes_new (self->dlbuf, (gsize) BENCH * BENCH * 4);
-      self->frame = gdk_memory_texture_new (BENCH, BENCH,
-                                            GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, bytes, BENCH * 4);
-      g_bytes_unref (bytes);
-      g_object_unref (tex);
-      gsk_render_node_unref (node);
+          g_object_unref (tex);             /* measurement only - do not retain */
+          gsk_render_node_unref (node);
+        }
     }
 
   self->angle += 0.045;
@@ -445,11 +413,6 @@ activate (GtkApplication *app, gpointer data)
 int
 main (int argc, char **argv)
 {
-#ifdef __ANDROID__
-  g_log_set_writer_func (android_log_writer, NULL, NULL);
-  /* enable the Vulkan validation layer (if bundled) and surface its diagnostics */
-  g_setenv ("GDK_DEBUG", "vulkan-validate", TRUE);
-#endif
   AdwApplication *app = adw_application_new ("space.ampernic.GtkVulkanDemo",
                                              G_APPLICATION_DEFAULT_FLAGS);
   g_signal_connect (app, "activate", G_CALLBACK (activate), NULL);

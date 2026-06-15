@@ -32,6 +32,8 @@
 			<patch>android-vulkan-procaddr-pre28</patch>
 			<patch>android-vulkan-backend</patch>
 			<patch>android-vulkan-primary</patch>
+			<patch>gsk-globals-ubo</patch>
+			<patch>gsk-transform-pushtransform-leak</patch>
 		</gtk>
 		<libadwaita/>
 	</dependencies>

@@ -12,7 +12,6 @@ deps = [
   dependency('gtk4'),
   dependency('libadwaita-1', version: '>= 1.4'),
   cc.find_library('m', required: false),
-  cc.find_library('log', required: false),   # Android liblog (routes GLib logs to logcat)
 ]
 
 # android_exe_type is a Pixiewood meson-fork kwarg; on Android the entry must be
