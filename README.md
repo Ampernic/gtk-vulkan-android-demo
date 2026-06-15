@@ -12,13 +12,19 @@ It exists to demonstrate the **gdk-android Vulkan backend** - see
 
 ## What it shows
 
-- **Renderer label** - the live `GskRenderer` type (`Vulkan` / `OpenGL` /
-  `Cairo`), read from the toplevel.
-- **Vulkan switch** - relaunches the process under `GSK_RENDERER=vulkan` or
-  `gl` (re-exec of `/proc/self/exe`), so you can A/B the same scene.
-- **Blur (GPU stress)** - wraps the scene in a GSK blur pass; the cheapest way
-  to make the renderer difference show up in the FPS counter.
-- **Gears** - density of the scene (more gears = more draw load).
+- **Uncapped frame time** - the scene is rendered off-screen with
+  `gsk_renderer_render_texture()` and forced to completion (a download), so the
+  reported `ms/frame` and FPS are the renderer's real cost, **not** the
+  vsync-capped on-screen rate. A heavier scene or a slower renderer shows a
+  higher `ms/frame`.
+- **Renderer** - a 3-way choice (`Vulkan` / `OpenGL` / `Cairo`) that relaunches
+  the process under the matching `GSK_RENDERER` (re-exec of `/proc/self/exe`),
+  so you can A/B the same scene across all three GSK backends.
+- **Blur** - a GPU-heavy pass that amplifies the difference between backends.
+- **Gears per row** - density of the 3D scene (more gears = more load).
+
+The scene is a perspective-projected 3D field of meshing gears (GSK 3D
+transforms), so it stresses geometry + compositing, not just fill.
 
 ## Build & run (desktop)
 
