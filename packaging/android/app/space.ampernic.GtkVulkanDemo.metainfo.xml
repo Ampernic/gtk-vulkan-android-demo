@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<component type="desktop-application">
+<component type="desktop-application" xmlns="https://specifications.freedesktop.org/metainfo/1.0">
   <id>space.ampernic.GtkVulkanDemo</id>
   <name>GTK Renderer Benchmark</name>
   <summary>Compare the Vulkan, OpenGL and Cairo GSK renderers</summary>
