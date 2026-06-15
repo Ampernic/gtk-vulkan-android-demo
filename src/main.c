@@ -254,8 +254,16 @@ gears_view_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
       double ms = (t1 - t0) / 1000.0;
       self->render_ms = self->render_ms == 0 ? ms : self->render_ms * 0.85 + ms * 0.15;
 
+      /* Display the downloaded pixels as a CPU texture and release the GPU
+       * texture immediately. Keeping the off-screen renderer's GPU texture and
+       * compositing it with the window's (different) renderer pins one BENCH
+       * texture per frame - a ~2MB/frame leak the OOM killer eventually reaps. */
       g_clear_object (&self->frame);
-      self->frame = tex;     /* keep for display */
+      GBytes *bytes = g_bytes_new (self->dlbuf, (gsize) BENCH * BENCH * 4);
+      self->frame = gdk_memory_texture_new (BENCH, BENCH,
+                                            GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, bytes, BENCH * 4);
+      g_bytes_unref (bytes);
+      g_object_unref (tex);
       gsk_render_node_unref (node);
     }
 
