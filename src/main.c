@@ -174,13 +174,17 @@ gears_view_set_backend (GearsView *self, int backend)
 {
   if (backend == self->backend)
     return;
-  GdkDisplay *display = gtk_widget_get_display (GTK_WIDGET (self));
-  if (display == NULL)
-    return;
+  /* Realize against the surface, not the display: the display-only (headless)
+   * path crashes the Android Vulkan backend, while the surface path is the one
+   * proven to work on device. render_texture renders off-screen regardless. */
+  GtkNative *native = gtk_widget_get_native (GTK_WIDGET (self));
+  GdkSurface *surface = native ? gtk_native_get_surface (native) : NULL;
+  if (surface == NULL)
+    return;   /* not realized yet; the tick retries */
 
   GError *err = NULL;
   GskRenderer *r = make_renderer (backend);
-  if (!gsk_renderer_realize_for_display (r, display, &err))
+  if (!gsk_renderer_realize (r, surface, &err))
     {
       g_warning ("%s renderer unavailable: %s",
                  backend == 0 ? "Vulkan" : backend == 2 ? "Cairo" : "OpenGL",
@@ -190,7 +194,7 @@ gears_view_set_backend (GearsView *self, int backend)
       if (backend == 1)             /* GL itself failed: nothing to fall back to */
         return;
       r = gsk_gl_renderer_new ();   /* graceful fallback */
-      if (!gsk_renderer_realize_for_display (r, display, &err))
+      if (!gsk_renderer_realize (r, surface, &err))
         {
           g_clear_error (&err);
           g_object_unref (r);
@@ -229,7 +233,7 @@ gears_view_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
   GearsView *self = GEARS_VIEW (widget);
 
   if (self->backend < 0)
-    gears_view_set_backend (self, 0);   /* prefer Vulkan; falls back to GL */
+    gears_view_set_backend (self, 1);   /* start on GL; Vulkan/Cairo are user-selectable */
   if (!self->renderer)
     return G_SOURCE_CONTINUE;
 
