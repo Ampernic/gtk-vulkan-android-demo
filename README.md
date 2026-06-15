@@ -8,7 +8,7 @@ live **FPS** counter, and lets you flip between the two renderers at runtime.
 It exists to demonstrate the **gdk-android Vulkan backend** - see
 [Android](#android) - but it runs on any GTK 4 platform.
 
-![screenshot](doc/screenshot.png)
+<p align="center"><img src="doc/screenshot.png" alt="screenshot" width="280"></p>
 
 ## What it shows
 
