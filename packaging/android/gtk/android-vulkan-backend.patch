@@ -15,9 +15,9 @@ surface has no native window yet (returns VK_ERROR_SURFACE_LOST_KHR).
 ---
  gdk/android/gdkandroiddisplay.c               | 12 +++
  gdk/android/gdkandroidvulkancontext-private.h | 53 +++++++++++++
- gdk/android/gdkandroidvulkancontext.c         | 78 +++++++++++++++++++
+ gdk/android/gdkandroidvulkancontext.c         | 82 +++++++++++++++++++
  gdk/android/meson.build                       |  1 +
- 4 files changed, 144 insertions(+)
+ 4 files changed, 148 insertions(+)
  create mode 100644 gdk/android/gdkandroidvulkancontext-private.h
  create mode 100644 gdk/android/gdkandroidvulkancontext.c
 
@@ -124,7 +124,7 @@ new file mode 100644
 index 0000000..a12b371
 --- /dev/null
 +++ b/gdk/android/gdkandroidvulkancontext.c
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,82 @@
 +/*
 + * Copyright (c) 2026 Anton Politov
 + *
@@ -170,6 +170,10 @@ index 0000000..a12b371
 +
 +  if (android_surface->native == NULL)
 +    {
++      /* No native window bound (surface detached, e.g. while backgrounded). This
++       * is expected and transient, so it is not a warning: surface-lost makes the
++       * renderer retry once the window is reattached. */
++      GDK_DEBUG (VULKAN, "no ANativeWindow bound, reporting VK_ERROR_SURFACE_LOST_KHR");
 +      g_mutex_unlock (&android_surface->native_lock);
 +      return VK_ERROR_SURFACE_LOST_KHR;
 +    }

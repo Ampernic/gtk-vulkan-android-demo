@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Pixiewood manifest for the renderer-benchmark demo. Run from the repo root
-     (where meson.build lives). Built against the API-26 + Vulkan gdk-android
+     (where meson.build lives). Built against the API-28 + Vulkan gdk-android
      patches in packaging/android/gtk/ (applied via the <gtk> entries below) and
-     the api26 branch of the gtk-android-builder fork (lowers minSdk + weak NDK
-     symbols), so the same APK runs Vulkan on API 28+ and GL on Android 8-9. -->
+     the api28 branch of the gtk-android-builder fork (lowers minSdk + weak NDK
+     symbols), so the same APK runs Vulkan on API 28+. -->
 <app xmlns="https://sp1rit.arpa/pixiewood/" xmlns:xi="http://www.w3.org/2001/XInclude">
 	<metainfo vercalc="count">
 		<xi:include href="src://packaging/android/app/space.ampernic.GtkVulkanDemo.metainfo.xml" parse="xml"/>
@@ -24,14 +24,16 @@
 		<iconv/>
 		<fontconfig/>
 		<gtk>
-			<!-- API 26 + Vulkan support for gdk-android (see each patch header). -->
+			<!-- API 28 + Vulkan support for gdk-android (see each patch header).
+			     Vulkan 1.1 entry points are link symbols from API 28, so no
+			     proc-addr shim is needed. -->
 			<patch>android-input-jni</patch>
 			<patch>android-choreographer-fallback</patch>
 			<patch>android-clipboard-lazy-manager</patch>
 			<patch>android-window-insets-pre30</patch>
-			<patch>android-vulkan-procaddr-pre28</patch>
 			<patch>android-vulkan-backend</patch>
 			<patch>android-vulkan-primary</patch>
+			<patch>android-accent-below-31</patch>
 			<patch>gsk-globals-ubo</patch>
 			<patch>gsk-transform-pushtransform-leak</patch>
 		</gtk>
@@ -42,7 +44,7 @@
 			<option>-Diconv:default_library=static</option>
 			<option>-Dgdk-pixbuf:android=disabled</option>
 			<!-- the whole point: Vulkan renderer enabled (the patches make it link
-			     on minSdk 26 and add the gdk-android WSI backend). -->
+			     on minSdk 28 and add the gdk-android WSI backend). -->
 			<option>-Dgtk:vulkan=enabled</option>
 		</configure-options>
 		<architectures>

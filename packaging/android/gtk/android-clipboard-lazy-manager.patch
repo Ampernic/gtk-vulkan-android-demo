@@ -78,7 +78,7 @@ index d108b5a..774c35f 100644
    GTask *task = g_task_new (clipboard, cancellable, callback, user_data);
    g_task_set_source_tag (task, gdk_android_clipboard_read_async);
    g_task_set_priority (task, io_priority);
-@@ -696,16 +716,36 @@ gdk_android_clipboard_class_init (GdkAndroidClipboardClass *klass)
+@@ -696,16 +716,41 @@ gdk_android_clipboard_class_init (GdkAndroidClipboardClass *klass)
    clipboard_class->read_finish = gdk_android_clipboard_read_finish;
  }
  
@@ -89,9 +89,14 @@ index d108b5a..774c35f 100644
 + * getSystemService(CLIPBOARD_SERVICE) only returns the manager from an activity
 + * context; at display-open time (when the clipboard object is constructed) the
 + * current context is still the application (see gdk_android_set_latest_activity in
-+ * the runtime start: "thiz isn't actually an activity"), so an early fetch yields
-+ * NULL on older Android. A real ToplevelActivity is bound shortly after, so we
-+ * defer the fetch to the first actual clipboard use and retry until it succeeds.
++ * the runtime start: "this isn't actually an activity"), so an early fetch yields
++ * NULL on older Android. A real ToplevelActivity is bound shortly after, so the
++ * fetch is deferred to the first actual clipboard use.
++ *
++ * This is not a busy loop: it just retries on each subsequent clipboard call and
++ * returns FALSE until a manager is available. If one never appears (no activity is
++ * ever bound), every caller handles the FALSE return and the clipboard simply stays
++ * inert - no spinning, no error spam beyond the per-call warning.
 + *
 + * Runs on the GTK thread, like every other clipboard entry point, so no locking. */
 +static gboolean
@@ -119,7 +124,7 @@ index d108b5a..774c35f 100644
    self->manager = (*env)->NewGlobalRef (env, clipboard_mgr);
  
    jobject listener = (*env)->NewObject (env, gdk_android_get_java_cache ()->clipboard_provider_change_listener.klass,
-@@ -718,6 +758,16 @@ gdk_android_clipboard_init (GdkAndroidClipboard *self)
+@@ -718,6 +763,16 @@ gdk_android_clipboard_init (GdkAndroidClipboard *self)
    (*env)->PopLocalFrame (env, NULL);
  
    gdk_android_clipboard_update_remote_formats (self);
@@ -136,7 +141,7 @@ index d108b5a..774c35f 100644
  }
  
  GdkClipboard *
-@@ -761,6 +811,9 @@ gdk_android_clipboard_description_to_formats (jobject clipdesc)
+@@ -761,6 +816,9 @@ gdk_android_clipboard_description_to_formats (jobject clipdesc)
  void
  gdk_android_clipboard_update_remote_formats (GdkAndroidClipboard *self)
  {

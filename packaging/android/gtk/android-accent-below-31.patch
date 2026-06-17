@@ -1,0 +1,50 @@
+--- a/gdk/android/gdkandroiddisplay.c
++++ b/gdk/android/gdkandroiddisplay.c
+@@ -19,6 +19,8 @@
+ 
+ #include "config.h"
+ 
++#include <android/api-level.h>
++
+ /* Expose VK_KHR_android_surface (vulkan_android.h) before any header pulls in
+  * vulkan.h, so VK_KHR_ANDROID_SURFACE_EXTENSION_NAME is available below. */
+ #define VK_USE_PLATFORM_ANDROID_KHR
+@@ -328,6 +330,12 @@
+ 
+   self->drags = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL, g_object_unref);
+ 
++  /* Default accent until update_configuration reads the system one. The system
++   * accent (system_accent1_600) is a Material You resource, API 31+; below that
++   * there is none, so this default stays. */
++  self->accent_color = 0xff3584e4;
++  self->accent_color_rgba = GDK_RGBA_INIT_FROM_INT (self->accent_color);
++
+   self->choreographer_source = gdk_android_choreographer_source_new (g_main_context_default ());
+   if (self->choreographer_source)
+     {
+@@ -453,9 +461,22 @@
+   jobject configuration = (*env)->CallObjectMethod (env, resources, gdk_android_get_java_cache ()->a_resources.get_configuration);
+   jint ui = (*env)->GetIntField (env, configuration, gdk_android_get_java_cache ()->a_configuration.ui);
+ 
+-  guint32 color = (guint32)(*env)->CallIntMethod (env, context,
+-                                                  gdk_android_get_java_cache ()->a_context.get_color,
+-                                                  gdk_android_get_java_cache ()->a_res_color.system_accent1_600);
++  /* system_accent1_600 is a Material You resource (API 31+); below that it does
++   * not resolve and getColor() would throw Resources$NotFoundException, so keep
++   * the current accent rather than calling into it. */
++  guint32 color = self->accent_color;
++  if (android_get_device_api_level () >= 31 &&
++      gdk_android_get_java_cache ()->a_res_color.klass != NULL)
++    {
++      color = (guint32)(*env)->CallIntMethod (env, context,
++                                              gdk_android_get_java_cache ()->a_context.get_color,
++                                              gdk_android_get_java_cache ()->a_res_color.system_accent1_600);
++      if ((*env)->ExceptionCheck (env))
++        {
++          (*env)->ExceptionClear (env);
++          color = self->accent_color;
++        }
++    }
+   (*env)->PopLocalFrame (env, NULL);
+ 
+   GdkAndroidDisplayNightMode night_mode = GDK_ANDROID_DISPLAY_NIGHT_UNDEFINED;
