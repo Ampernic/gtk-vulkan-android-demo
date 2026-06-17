@@ -15,6 +15,7 @@
 #include <math.h>
 
 #define BENCH 720            /* fixed off-screen render resolution (consistent metric) */
+#define BENCH_REPEAT 16      /* scenes drawn per readback to amortise the GPU round-trip */
 
 /* ---- a single cog/gear drawn once into a texture ---------------------- */
 
@@ -109,6 +110,44 @@ build_scene (GtkSnapshot *s, double w, double h, GdkTexture *gear,
     gtk_snapshot_pop (s);
 }
 
+/* Globals-stress scene: deeply nested transforms (mvp changes every level) with a
+ * rounded-clipped colour at each level (clip changes every level). This hammers the
+ * per-op globals path the same way @otte's benchmark node does, but stays visible so
+ * a wrong globals delivery (push vs UBO) shows up as garbled output. */
+#define STRESS_LEVELS 24
+static void
+build_transform_stress (GtkSnapshot *s, double w, double h, double angle)
+{
+  gtk_snapshot_append_color (s, &(GdkRGBA){ 0.09f, 0.10f, 0.12f, 1.0f },
+                             &GRAPHENE_RECT_INIT (0, 0, (float) w, (float) h));
+
+  float side = (float) MIN (w, h) * 0.8f;
+  gtk_snapshot_save (s);
+  gtk_snapshot_translate (s, &GRAPHENE_POINT_INIT ((float) w / 2, (float) h / 2));
+
+  for (int i = 0; i < STRESS_LEVELS; i++)
+    {
+      /* cumulative transform: every level pushes a fresh mvp */
+      gtk_snapshot_rotate (s, (float) (angle * 12.0 + i * 7.0));
+      gtk_snapshot_scale (s, 0.93f, 0.93f);
+
+      GdkRGBA col = {
+        0.5f + 0.5f * (float) sin (i * 0.5 + angle),
+        0.5f + 0.5f * (float) sin (i * 0.5 + angle + 2.0),
+        0.5f + 0.5f * (float) sin (i * 0.5 + angle + 4.0),
+        1.0f
+      };
+      graphene_rect_t r = GRAPHENE_RECT_INIT (-side / 2, -side / 2, side, side);
+      GskRoundedRect rr;
+      gsk_rounded_rect_init_from_rect (&rr, &r, side * 0.18f);
+      gtk_snapshot_push_rounded_clip (s, &rr);
+      gtk_snapshot_append_color (s, &col, &r);
+      gtk_snapshot_pop (s);
+    }
+
+  gtk_snapshot_restore (s);
+}
+
 /* ---- the widget: off-screen benchmark + on-screen display ------------- */
 
 /* combo order: 0 Vulkan, 1 OpenGL, 2 Cairo */
@@ -127,11 +166,26 @@ struct _GearsView
   double       angle;
   int          density;
   gboolean     blur;
+  int          scene;        /* 0 = gears, 1 = transform stress */
   double       render_ms;    /* smoothed off-screen frame cost (uncapped) */
   GtkLabel    *fps_label;
   GtkLabel    *renderer_label;
   AdwComboRow *combo;
+
+  /* automated sweep: every renderer x scene, collected into a table */
+  gboolean     collecting;
+  int          collect_combo;            /* 0..5: renderer = combo/2, scene = combo%2 */
+  int          collect_frames;           /* frames spent on the current combo */
+  int          collect_n;                /* raw samples gathered for the current combo */
+  double       collect_samples[64];
+  double       results[3][2];            /* ms/frame per renderer per scene; NAN = n/a */
+  int          saved_backend, saved_scene;
+  GtkLabel    *table_label;
+  AdwComboRow *scene_combo;
 };
+
+#define COLLECT_WARMUP  20               /* frames discarded before sampling a combo */
+#define COLLECT_SAMPLES 40               /* frames sampled per combo (median taken) */
 G_DEFINE_FINAL_TYPE (GearsView, gears_view, GTK_TYPE_WIDGET)
 
 #define GEAR_PX 110.0
@@ -192,7 +246,14 @@ gears_view_set_backend (GearsView *self, int backend)
       g_clear_error (&err);
       g_object_unref (r);
       if (backend == 1)             /* GL itself failed: nothing to fall back to */
-        return;
+        {
+          /* Keep the current renderer and reflect that in the combo, so the UI
+           * does not falsely show OpenGL (e.g. emulators whose EGL lacks
+           * EGL_KHR_surfaceless_context, which the GL renderer requires). */
+          if (self->combo)
+            adw_combo_row_set_selected (self->combo, (guint) self->backend);
+          return;
+        }
       r = gsk_gl_renderer_new ();   /* graceful fallback */
       if (!gsk_renderer_realize (r, surface, &err))
         {
@@ -226,7 +287,91 @@ gears_view_snapshot (GtkWidget *widget, GtkSnapshot *snapshot)
    * are created or retained, so nothing accumulates in the renderer's texture
    * cache. The Cairo selection is shown flat (Cairo has no 3D); GL/Vulkan 3D. */
   gboolean flat = self->backend == 2;
-  build_scene (snapshot, w, h, self->gear, self->angle, self->density, self->blur, flat);
+  if (self->scene == 1)
+    build_transform_stress (snapshot, w, h, self->angle);
+  else
+    build_scene (snapshot, w, h, self->gear, self->angle, self->density, self->blur, flat);
+}
+
+/* ---- automated sweep: every renderer x scene into a table ------------- */
+
+static const char *const RENDERER_NAMES[3] = { "Vulkan", "OpenGL", "Cairo" };
+static const char *const SCENE_NAMES[2]    = { "Gears", "Transform stress" };
+
+static int
+cmp_double (const void *a, const void *b)
+{
+  double x = *(const double *) a, y = *(const double *) b;
+  return (x > y) - (x < y);
+}
+
+static double
+median_of (double *v, int n)
+{
+  if (n <= 0)
+    return NAN;
+  qsort (v, n, sizeof *v, cmp_double);
+  return n & 1 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+/* point the sweep at its current combo (renderer + scene); the next ticks warm
+ * up and then sample it. A scene-only change keeps the same renderer. */
+static void
+collect_apply_combo (GearsView *self)
+{
+  self->scene = self->collect_combo % 2;
+  gears_view_set_backend (self, self->collect_combo / 2);  /* may fall back */
+  self->collect_frames = 0;
+  self->collect_n = 0;
+}
+
+static void
+collect_render_table (GearsView *self)
+{
+  /* on-screen: a compact monospace grid */
+  GString *ui = g_string_new ("<tt>            Gears    Transform\n");
+  /* logcat: a markdown table ready to paste into a reply */
+  GString *md = g_string_new ("\n| Renderer | Gears (ms/frame) | Transform stress (ms/frame) |\n"
+                              "|---|---|---|\n");
+  for (int r = 0; r < 3; r++)
+    {
+      g_string_append_printf (ui, "%-9s", RENDERER_NAMES[r]);
+      g_string_append_printf (md, "| %s |", RENDERER_NAMES[r]);
+      for (int s = 0; s < 2; s++)
+        {
+          double m = self->results[r][s];
+          if (isnan (m))
+            {
+              g_string_append (ui, s == 0 ? "   n/a   " : "   n/a");
+              g_string_append (md, " n/a |");
+            }
+          else
+            {
+              g_string_append_printf (ui, s == 0 ? " %6.2f  " : " %6.2f", m);
+              g_string_append_printf (md, " %.2f (%.0f fps) |", m, 1000.0 / m);
+            }
+        }
+      g_string_append_c (ui, '\n');
+      g_string_append_c (md, '\n');
+    }
+  g_string_append (ui, "</tt>");
+  if (self->table_label)
+    gtk_label_set_markup (self->table_label, ui->str);
+  g_message ("benchmark results (%d scenes/readback, BENCH %dpx):%s",
+             BENCH_REPEAT, BENCH, md->str);
+  g_string_free (ui, TRUE);
+  g_string_free (md, TRUE);
+}
+
+static void
+collect_finish (GearsView *self)
+{
+  self->collecting = FALSE;
+  self->scene = self->saved_scene;
+  gears_view_set_backend (self, self->saved_backend);
+  if (self->scene_combo)
+    adw_combo_row_set_selected (self->scene_combo, (guint) self->saved_scene);
+  collect_render_table (self);
 }
 
 static gboolean
@@ -244,22 +389,56 @@ gears_view_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
     {
       gboolean flat = renderer_backend (self->renderer) == 2;
       GtkSnapshot *s = gtk_snapshot_new ();
-      build_scene (s, BENCH, BENCH, self->gear, self->angle, self->density, self->blur, flat);
+      /* gsk_renderer_render_texture() submits, waits on a fence, resolves the
+       * tile buffer and downloads it on every call. That round-trip is a fixed
+       * per-call cost (tens of ms on mobile tilers) independent of scene weight,
+       * so a single light scene per readback makes every GPU renderer look as
+       * slow as the readback and lets Cairo (no GPU round-trip) "win". Draw
+       * BENCH_REPEAT scenes tiled in a grid into one node and read back once:
+       * the grid avoids occlusion culling dropping stacked copies, so the GPU
+       * really does REPEAT x the work (and REPEAT x the globals ops), and
+       * dividing by REPEAT amortises the round-trip away. The number is then the
+       * real per-frame render cost, comparable across renderers. */
+      int cols = (int) ceil (sqrt ((double) BENCH_REPEAT));
+      int rows = (BENCH_REPEAT + cols - 1) / cols;
+      float cw = (float) BENCH / cols, ch = (float) BENCH / rows;
+      for (int i = 0; i < BENCH_REPEAT; i++)
+        {
+          gtk_snapshot_save (s);
+          gtk_snapshot_translate (s, &GRAPHENE_POINT_INIT ((i % cols) * cw, (i / cols) * ch));
+          if (self->scene == 1)
+            build_transform_stress (s, cw, ch, self->angle);
+          else
+            build_scene (s, cw, ch, self->gear, self->angle, self->density, self->blur, flat);
+          gtk_snapshot_restore (s);
+        }
       GskRenderNode *node = gtk_snapshot_free_to_node (s);
       if (node)
         {
           gint64 t0 = g_get_monotonic_time ();
-          /* gsk_renderer_render_texture() already waits for the GPU before it
-           * returns (it downloads into the result), so this measures the real
-           * render cost. We deliberately do NOT add a second gdk_texture_download:
-           * that extra GPU->CPU readback (and tile resolve on Mali) is renderer-
-           * unfair noise, not render cost. */
           GdkTexture *tex = gsk_renderer_render_texture (self->renderer, node,
                                                          &GRAPHENE_RECT_INIT (0, 0, BENCH, BENCH));
           gint64 t1 = g_get_monotonic_time ();
 
-          double ms = (t1 - t0) / 1000.0;
+          double ms = (t1 - t0) / 1000.0 / BENCH_REPEAT;
           self->render_ms = self->render_ms == 0 ? ms : self->render_ms * 0.85 + ms * 0.15;
+
+          if (self->collecting)
+            {
+              if (++self->collect_frames > COLLECT_WARMUP && self->collect_n < COLLECT_SAMPLES)
+                self->collect_samples[self->collect_n++] = ms;
+              if (self->collect_n >= COLLECT_SAMPLES)
+                {
+                  int r = self->collect_combo / 2, s = self->collect_combo % 2;
+                  self->results[r][s] = renderer_backend (self->renderer) == r
+                                          ? median_of (self->collect_samples, self->collect_n)
+                                          : NAN;   /* requested renderer fell back */
+                  if (++self->collect_combo >= 6)
+                    collect_finish (self);
+                  else
+                    collect_apply_combo (self);
+                }
+            }
 
           g_object_unref (tex);             /* measurement only - do not retain */
           gsk_render_node_unref (node);
@@ -269,8 +448,15 @@ gears_view_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer data)
   self->angle += 0.045;
   if (self->fps_label)
     {
-      double fps = self->render_ms > 0 ? 1000.0 / self->render_ms : 0;
-      char *str = g_strdup_printf ("%.1f ms/frame  ·  %.0f FPS (uncapped)", self->render_ms, fps);
+      char *str;
+      if (self->collecting)
+        str = g_strdup_printf ("collecting %s / %s  ·  %d/%d",
+                               RENDERER_NAMES[self->collect_combo / 2],
+                               SCENE_NAMES[self->collect_combo % 2],
+                               MIN (self->collect_n, COLLECT_SAMPLES), COLLECT_SAMPLES);
+      else
+        str = g_strdup_printf ("%.1f ms/frame  ·  %.0f FPS (uncapped)",
+                               self->render_ms, self->render_ms > 0 ? 1000.0 / self->render_ms : 0);
       gtk_label_set_text (self->fps_label, str);
       g_free (str);
     }
@@ -320,6 +506,12 @@ on_renderer_selected (AdwComboRow *row, GParamSpec *ps, gpointer data)
 }
 
 static void
+on_scene_selected (AdwComboRow *row, GParamSpec *ps, gpointer data)
+{
+  GEARS_VIEW (data)->scene = (int) adw_combo_row_get_selected (row);
+}
+
+static void
 on_blur_toggled (AdwSwitchRow *row, GParamSpec *ps, gpointer data)
 {
   GEARS_VIEW (data)->blur = adw_switch_row_get_active (row);
@@ -329,6 +521,22 @@ static void
 on_density (GtkAdjustment *adj, gpointer data)
 {
   GEARS_VIEW (data)->density = (int) gtk_adjustment_get_value (adj);
+}
+
+static void
+on_collect_clicked (GtkButton *btn, gpointer data)
+{
+  GearsView *self = GEARS_VIEW (data);
+  if (self->collecting)
+    return;
+  self->saved_backend = self->backend < 0 ? 0 : self->backend;
+  self->saved_scene = self->scene;
+  for (int r = 0; r < 3; r++)
+    for (int s = 0; s < 2; s++)
+      self->results[r][s] = NAN;
+  self->collect_combo = 0;
+  self->collecting = TRUE;
+  collect_apply_combo (self);
 }
 
 static void
@@ -378,6 +586,15 @@ activate (GtkApplication *app, gpointer data)
   g_signal_connect (rcombo, "notify::selected", G_CALLBACK (on_renderer_selected), gears);
   gtk_list_box_append (GTK_LIST_BOX (list), rcombo);
 
+  GtkStringList *scenes = gtk_string_list_new ((const char *[]){ "Gears", "Transform stress", NULL });
+  GtkWidget *scombo = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (scombo), "Scene");
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (scombo), "Transform stress hammers the per-op globals path");
+  adw_combo_row_set_model (ADW_COMBO_ROW (scombo), G_LIST_MODEL (scenes));
+  GEARS_VIEW (gears)->scene_combo = ADW_COMBO_ROW (scombo);
+  g_signal_connect (scombo, "notify::selected", G_CALLBACK (on_scene_selected), gears);
+  gtk_list_box_append (GTK_LIST_BOX (list), scombo);
+
   GtkWidget *blur = adw_switch_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (blur), "Blur");
   adw_action_row_set_subtitle (ADW_ACTION_ROW (blur), "GPU-heavy pass to amplify the renderer difference");
@@ -392,8 +609,25 @@ activate (GtkApplication *app, gpointer data)
                     "value-changed", G_CALLBACK (on_density), gears);
   gtk_list_box_append (GTK_LIST_BOX (list), dens);
 
+  GtkWidget *collect = gtk_button_new_with_label ("Collect all (renderer × scene)");
+  gtk_widget_add_css_class (collect, "pill");
+  gtk_widget_add_css_class (collect, "suggested-action");
+  gtk_widget_set_margin_top (collect, 12);
+  g_signal_connect (collect, "clicked", G_CALLBACK (on_collect_clicked), gears);
+
+  GtkWidget *table = gtk_label_new (NULL);
+  gtk_label_set_xalign (GTK_LABEL (table), 0.0f);
+  gtk_widget_set_margin_top (table, 8);
+  gtk_label_set_markup (GTK_LABEL (table), "<tt>press Collect to sweep all renderers</tt>");
+  GEARS_VIEW (gears)->table_label = GTK_LABEL (table);
+
+  GtkWidget *col = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_box_append (GTK_BOX (col), list);
+  gtk_box_append (GTK_BOX (col), collect);
+  gtk_box_append (GTK_BOX (col), table);
+
   GtkWidget *clamp = adw_clamp_new ();
-  adw_clamp_set_child (ADW_CLAMP (clamp), list);
+  adw_clamp_set_child (ADW_CLAMP (clamp), col);
   gtk_widget_set_margin_top (clamp, 12);
   gtk_widget_set_margin_bottom (clamp, 12);
   gtk_widget_set_margin_start (clamp, 12);
